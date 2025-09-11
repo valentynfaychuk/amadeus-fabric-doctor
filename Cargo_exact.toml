@@ -1,0 +1,26 @@
+[package]
+name = "fabric-reader"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+# EXACT VERSION COMPATIBILITY ISSUE:
+# The Erlang wrapper uses RocksDB 7.7.3, but no Rust crate bundles this exact version.
+# Available options:
+# - librocksdb-sys 0.8.3+7.4.4 (older, RocksDB 7.4.4)
+# - librocksdb-sys 0.10.0+7.9.2 (newer, RocksDB 7.9.2) <- closest match
+# - Build custom binding with exact 7.7.3 (see README_EXACT_VERSION.md)
+
+# Using closest available version - may have compatibility issues
+rocksdb = { version = "0.19.0", default-features = false }
+# This version uses librocksdb-sys 0.8.0+7.4.4 which is close to 7.7.3
+
+serde_json = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+
+[build-dependencies]
