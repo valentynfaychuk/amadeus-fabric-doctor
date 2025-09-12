@@ -12,13 +12,9 @@ struct Cli {
     #[arg(short, long)]
     db_path: String,
 
-    /// Path to the second RocksDB database directory (target for migration)
-    #[arg(long)]
-    db2_path: Option<String>,
-
-    /// Migrate contractstate column family from db-path to db2-path
-    #[arg(long, requires = "db2_path")]
-    migrate: bool,
+    /// Migrate contractstate column family from db-path to this target database path
+    #[arg(long, value_name = "TARGET_DB_PATH")]
+    migrate: Option<String>,
 
     /// List all available keys in contractstate column family
     #[arg(short, long)]
@@ -40,12 +36,8 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if cli.migrate {
-        if let Some(db2_path) = cli.db2_path {
-            perform_migration(&cli.db_path, &db2_path)?;
-        } else {
-            return Err(anyhow!("--db2-path is required for migration"));
-        }
+    if let Some(target_db_path) = cli.migrate {
+        perform_migration(&cli.db_path, &target_db_path)?;
     } else {
         // Open the database with contractstate column family
         let db = open_fabric_database(&cli.db_path)?;

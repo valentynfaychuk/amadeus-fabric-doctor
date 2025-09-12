@@ -74,12 +74,12 @@ The binary will be available at `target/release/fabric-reader`.
 
 #### Migrate contractstate from old RocksDB to new RocksDB
 ```bash
-./fabric-reader --db-path /path/to/old/db --db2-path /path/to/new/db --migrate
+./fabric-reader --db-path /path/to/old/db --migrate /path/to/new/db
 ```
 
 This command will:
 1. **Validate** that the source database exists and contains the contractstate column family
-2. **Create** a new database at `db2-path` if it doesn't exist (with latest RocksDB 10.4.2+)
+2. **Create** a new database at the target path if it doesn't exist (with latest RocksDB 10.4.2+)
 3. **Migrate** all contractstate data from the source to the target database
 4. **Verify** that the migration was successful by comparing entry counts
 5. **Report** detailed statistics about the migration
@@ -100,8 +100,7 @@ Usage: fabric-reader [OPTIONS] --db-path <DB_PATH>
 
 Options:
   -d, --db-path <DB_PATH>    Path to the RocksDB database directory (source for migration)
-      --db2-path <DB2_PATH>  Path to the second RocksDB database directory (target for migration)
-      --migrate              Migrate contractstate column family from db-path to db2-path
+      --migrate <TARGET_DB_PATH>  Migrate contractstate column family from db-path to this target database path
   -l, --list-keys            List all available keys in contractstate column family
   -k, --key <KEY>            Get value for a specific key (hex format)
   -e, --export <EXPORT>      Export all contractstate data to JSON file
@@ -115,7 +114,7 @@ Options:
 - **Erlang RocksDB**: 7.7.3 (as used by Amadeus blockchain node)
 - **Rust Crate**: 0.19.0 (closest available, bundles ~7.4.4)
 
-### Target Database (--db2-path)
+### Target Database (--migrate argument)
 - **RocksDB**: 10.4.2+
 - **Rust Crate**: 0.23.0 (latest stable, bundles 10.4.2)
 
@@ -192,7 +191,7 @@ The tool handles various data formats stored in the contractstate column family:
 ./fabric-reader --db-path /amadeus/work_folder/db/fabric --export backup.json
 
 # 3. Perform migration
-./fabric-reader --db-path /amadeus/work_folder/db/fabric --db2-path /amadeus/migrated_fabric --migrate
+./fabric-reader --db-path /amadeus/work_folder/db/fabric --migrate /amadeus/migrated_fabric
 
 # 4. Verify migrated database
 ./fabric-reader --db-path /amadeus/migrated_fabric --list-keys
