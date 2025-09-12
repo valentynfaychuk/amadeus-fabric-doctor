@@ -18,3 +18,7 @@ bs58 = "0.5"
 # For ETF parsing - Erlang Term Format  
 # eetf = "0.7"  # Disabled due to API compatibility issues
 # We'll implement basic ETF detection instead
+
+[workspace]
+# workaround to allow running this crate independently
+# even if it is cloned into an umbrella cargo workspace
