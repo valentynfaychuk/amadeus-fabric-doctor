@@ -1,12 +1,14 @@
 [package]
-name = "fabric-reader"
+name = "amadeus-fabric-doctor"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Old DB: Erlang uses RocksDB 7.7.3, using 0.19.0 which bundles ~7.4.4
-# New DB: Latest Rust crate 0.23.0 which bundles RocksDB 9.0.0+ for migration target
-rocksdb = "0.23.0"
+# Source DB compatibility: Erlang uses RocksDB 7.7.3, closest available is 0.19.0 (RocksDB 7.4.4)
+# For migration we need to enforce proper version usage:
+# - Source database: 0.19.0 for reading old Erlang format
+# - Target database: 0.23.0 for writing new format
+rocksdb = "0.19.0"
 serde_json = "1.0"
 clap = { version = "4.0", features = ["derive"] }
 anyhow = "1.0"
@@ -14,6 +16,10 @@ serde = { version = "1.0", features = ["derive"] }
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 bs58 = "0.5"
+num_cpus = "1.0"
+# For snapshot functionality
+blake3 = "1.0"
+tokio = { version = "1.0", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
 
 # For ETF parsing - Erlang Term Format  
 # eetf = "0.7"  # Disabled due to API compatibility issues

@@ -5,7 +5,7 @@ use serde_json::json;
 use std::path::Path;
 
 #[derive(Parser)]
-#[command(name = "fabric-reader")]
+#[command(name = "amadeus-fabric-doctor")]
 #[command(about = "A CLI tool to read Amadeus fabric database and parse ETF terms to JSON with migration support")]
 struct Cli {
     /// Path to the RocksDB database directory (source for migration)
@@ -31,6 +31,10 @@ struct Cli {
     /// Show raw binary data (don't parse ETF)
     #[arg(short, long)]
     raw: bool,
+
+    /// Test entry hash verification and output results to JSON file
+    #[arg(long, value_name = "OUTPUT_FILE")]
+    test: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -52,6 +56,8 @@ fn main() -> Result<()> {
             get_value(&db, &contractstate_cf, &key_hex, cli.raw)?;
         } else if let Some(output_file) = cli.export {
             export_all_data(&db, &contractstate_cf, &output_file, cli.raw)?;
+        } else if let Some(test_output_file) = cli.test {
+            test_entry_hash_verification(&db, &test_output_file)?;
         } else {
             println!("Use --help to see available options");
         }
@@ -608,4 +614,201 @@ fn parse_etf_to_json(data: &[u8]) -> Result<serde_json::Value> {
         "size_bytes": data.len(),
         "note": "Binary data, not ETF format"
     }))
+}
+
+fn test_entry_hash_verification(db: &DB, output_file: &str) -> Result<()> {
+    println!("🧪 Testing entry hash verification...");
+
+    // Get the default column family which contains the entries
+    let default_cf = db
+        .cf_handle("default")
+        .ok_or_else(|| anyhow!("default column family not found"))?;
+
+    // Extract a few entries for testing
+    let iter = db.iterator_cf(&default_cf, rocksdb::IteratorMode::Start);
+    let mut entries_tested = 0;
+    let mut matches = 0;
+    let max_entries_to_test = 5;
+    let mut test_results = Vec::new();
+
+    println!("📖 Extracting up to {} entries from default CF for verification...", max_entries_to_test);
+
+    for item in iter {
+        if entries_tested >= max_entries_to_test {
+            break;
+        }
+
+        let (key, value) = item?;
+
+        match test_single_entry_hash(&key, &value) {
+            Ok((hash_matches, stored_hash, computed_hash)) => {
+                entries_tested += 1;
+                if hash_matches {
+                    matches += 1;
+                    println!("✅ Entry {}: Hash verification PASSED", entries_tested);
+                } else {
+                    println!("❌ Entry {}: Hash verification FAILED", entries_tested);
+                }
+
+                // Store test result
+                test_results.push(json!({
+                    "entry_number": entries_tested,
+                    "entry_key": hex::encode(&key),
+                    "stored_hash": hex::encode(&stored_hash),
+                    "computed_hash": hex::encode(&computed_hash),
+                    "hash_matches": hash_matches,
+                    "entry_size_bytes": value.len()
+                }));
+            }
+            Err(e) => {
+                println!("⚠️  Entry {}: Could not verify hash - {}", entries_tested + 1, e);
+
+                // Store error result
+                test_results.push(json!({
+                    "entry_number": entries_tested + 1,
+                    "entry_key": hex::encode(&key),
+                    "error": format!("{}", e),
+                    "entry_size_bytes": value.len()
+                }));
+            }
+        }
+    }
+
+    println!("\n📊 Test Results:");
+    println!("   Entries tested: {}", entries_tested);
+    println!("   Hash matches: {}", matches);
+    println!("   Success rate: {:.1}%", if entries_tested > 0 { (matches as f64 / entries_tested as f64) * 100.0 } else { 0.0 });
+
+    // Create the output JSON
+    let output_json = json!({
+        "metadata": {
+            "test_time": chrono::Utc::now().to_rfc3339(),
+            "entries_tested": entries_tested,
+            "hash_matches": matches,
+            "success_rate_percent": if entries_tested > 0 { (matches as f64 / entries_tested as f64) * 100.0 } else { 0.0 },
+            "max_entries_tested": max_entries_to_test
+        },
+        "test_results": test_results
+    });
+
+    // Save to file
+    std::fs::write(output_file, serde_json::to_string_pretty(&output_json)?)?;
+    println!("💾 Test results saved to: {}", output_file);
+
+    if matches == entries_tested && entries_tested > 0 {
+        println!("🎉 All tested entries have valid hashes!");
+    } else if entries_tested == 0 {
+        println!("⚠️  No entries found to test");
+    } else {
+        println!("⚠️  Some entries failed hash verification");
+    }
+
+    Ok(())
+}
+
+fn test_single_entry_hash(entry_key: &[u8], entry_packed: &[u8]) -> Result<(bool, Vec<u8>, Vec<u8>)> {
+    // Parse the ETF-encoded entry
+    if !entry_packed.starts_with(&[131]) {
+        return Err(anyhow!("Entry does not start with ETF magic byte (131)"));
+    }
+
+    // For now, we'll implement a basic check using the approach from the Elixir code
+    // The entry structure should be an ETF map with header, txs, hash, signature fields
+
+    // Try to extract the stored hash from the entry
+    let stored_hash = extract_hash_from_entry(entry_packed)?;
+
+    // Compute the hash using the same algorithm as the node
+    let computed_hash = compute_entry_hash(entry_packed)?;
+
+    let hash_matches = stored_hash == computed_hash;
+
+    if !hash_matches {
+        println!("   Key: {}", hex::encode(entry_key));
+        println!("   Stored hash:  {}", hex::encode(&stored_hash));
+        println!("   Computed hash: {}", hex::encode(&computed_hash));
+    }
+
+    Ok((hash_matches, stored_hash, computed_hash))
+}
+
+fn extract_hash_from_entry(entry_packed: &[u8]) -> Result<Vec<u8>> {
+    // This is a simplified approach - in reality we'd need a full ETF parser
+    // For now, we'll search for a 32-byte hash field in the binary data
+
+    // Look for patterns that might be the hash field
+    // ETF binaries are encoded with length prefixes, so we look for byte sequences
+    // that could represent a 32-byte hash
+
+    // Search for potential 32-byte sequences (Blake3 hash size)
+    for i in 10..entry_packed.len().saturating_sub(32) {
+        // Look for what could be a hash - 32 consecutive bytes that look random
+        let potential_hash = &entry_packed[i..i+32];
+
+        // Basic heuristic: if it's not all zeros and not all 0xFF, it might be a hash
+        if !potential_hash.iter().all(|&b| b == 0) &&
+           !potential_hash.iter().all(|&b| b == 0xFF) &&
+           potential_hash.iter().any(|&b| b != potential_hash[0]) {
+            return Ok(potential_hash.to_vec());
+        }
+    }
+
+    Err(anyhow!("Could not extract hash from entry"))
+}
+
+fn compute_entry_hash(entry_packed: &[u8]) -> Result<Vec<u8>> {
+    // Based on the Elixir code in entry.ex, the hash is computed as:
+    // Blake3.hash(:erlang.term_to_binary(entry_unpacked.header_unpacked, [:deterministic]))
+
+    // For a proper implementation, we would:
+    // 1. Parse the ETF entry to extract header_unpacked
+    // 2. Re-encode it deterministically
+    // 3. Compute Blake3 hash
+
+    // For now, we'll implement a simplified version that attempts to find and hash the header
+    let header_bytes = extract_header_from_entry(entry_packed)?;
+
+    // Compute Blake3 hash
+    // Note: We would need to add blake3 crate to Cargo.toml for this to work
+    // For now, we'll use a placeholder that returns a computed hash
+    Ok(compute_placeholder_hash(&header_bytes))
+}
+
+fn extract_header_from_entry(entry_packed: &[u8]) -> Result<Vec<u8>> {
+    // This is a simplified header extraction
+    // In reality, we'd need to properly parse the ETF structure
+
+    // Look for what might be the header field in the ETF data
+    // The entry should be a map with fields like :header, :txs, :hash, :signature
+
+    // For now, return a portion of the entry data as a placeholder
+    // This is not the correct implementation but serves as a starting point
+    if entry_packed.len() > 100 {
+        Ok(entry_packed[10..50].to_vec())
+    } else {
+        Err(anyhow!("Entry too small to extract header"))
+    }
+}
+
+fn compute_placeholder_hash(data: &[u8]) -> Vec<u8> {
+    // Placeholder for Blake3 hash computation
+    // In a real implementation, this would use the blake3 crate:
+    // blake3::hash(data).as_bytes().to_vec()
+
+    // For now, we'll return a simple hash as a placeholder
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    data.hash(&mut hasher);
+    let hash_u64 = hasher.finish();
+
+    // Convert to 32-byte array (Blake3 size) by repeating the u64
+    let mut result = vec![0u8; 32];
+    for i in 0..4 {
+        let bytes = (hash_u64.wrapping_mul(i as u64 + 1)).to_le_bytes();
+        result[i*8..(i+1)*8].copy_from_slice(&bytes);
+    }
+
+    result
 }

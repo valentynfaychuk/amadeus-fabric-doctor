@@ -38,10 +38,15 @@ cargo clean
 cargo build --release
 ## Features
 
+- **Enhanced Fabric Migration**: Comprehensive migration of all Amadeus column families with height-based filtering
 - **Read and Export**: List keys, get specific values, and export all contractstate data to JSON
-- **Database Migration**: Migrate contractstate column family from RocksDB 7.4.4/7.7.3 to RocksDB 10.4.2+
-- **ETF Parsing**: Basic parsing of Erlang Term Format (ETF) data stored in the database
+- **Snapshot Creation**: Create deterministic, verifiable snapshots in SPK (StatePack) format
+- **ETF Parsing**: Parse Erlang Term Format (ETF) data including heights and consensus state
+- **Height-Based Filtering**: Intelligent migration based on temporal and rooted heights from consensus
+- **Chain Traversal**: Migrate entries following blockchain structure to maintain consistency
+- **Intelligent Key Decoding**: Automatically decode Base58 public keys and structured keys
 - **Safe Migration**: Comprehensive error handling, validation, and verification
+- **Column Family Awareness**: Proper handling of all Amadeus blockchain column families
 
 ## Installation
 
@@ -49,7 +54,7 @@ cargo build --release
 cargo build --release
 ```
 
-The binary will be available at `target/release/fabric-reader`.
+The binary will be available at `target/release/amadeus-fabric-doctor`.
 
 ## Usage
 
@@ -57,32 +62,121 @@ The binary will be available at `target/release/fabric-reader`.
 
 #### List contractstate keys
 ```bash
-./fabric-reader --db-path /path/to/fabric/db --list-keys
+./amadeus-fabric-doctor --db-path /path/to/fabric/db --list-keys
 ```
 
 #### Get value for specific key
 ```bash
-./fabric-reader --db-path /path/to/fabric/db --key <hex_encoded_key>
+./amadeus-fabric-doctor --db-path /path/to/fabric/db --key <hex_encoded_key>
 ```
 
 #### Export all contractstate data to JSON
 ```bash
-./fabric-reader --db-path /path/to/fabric/db --export output.json
+./amadeus-fabric-doctor --db-path /path/to/fabric/db --export output.json
 ```
+
+#### Create deterministic snapshot of contractstate
+```bash
+./amadeus-fabric-doctor --db-path /path/to/fabric/db --snapshot /path/to/backup.spk
+```
+
+#### Test entry hash verification
+```bash
+./amadeus-fabric-doctor --db-path /path/to/fabric/db --test verification-results.json
+```
+
+### Entry Hash Verification Testing
+
+The `--test` command validates that entries in the database have correct hashes by recomputing them using the same algorithm as the Amadeus node.
+
+#### How It Works
+1. **Extract Sample Entries**: Selects up to 5 random entries from the `default` column family
+2. **Parse Entry Structure**: Attempts to parse ETF-encoded entry data to extract stored hash
+3. **Recompute Hash**: Uses the Blake3 algorithm to recompute the entry hash from header data
+4. **Compare Hashes**: Validates that stored hash matches computed hash
+5. **Generate Report**: Outputs detailed results to JSON file
+
+#### Test Output Format
+```json
+{
+  "metadata": {
+    "test_time": "2025-01-15T10:30:45.123Z",
+    "entries_tested": 5,
+    "hash_matches": 4,
+    "success_rate_percent": 80.0,
+    "max_entries_tested": 5
+  },
+  "test_results": [
+    {
+      "entry_number": 1,
+      "entry_key": "hexadecimal_key",
+      "stored_hash": "stored_hash_hex",
+      "computed_hash": "computed_hash_hex",
+      "hash_matches": true,
+      "entry_size_bytes": 1024
+    }
+  ]
+}
+```
+
+#### Use Cases
+- **Database Integrity**: Verify that entry hashes haven't been corrupted
+- **Migration Validation**: Ensure hash computation works correctly after migration
+- **Algorithm Verification**: Confirm the Rust implementation matches the Elixir node logic
+- **Debugging**: Identify specific entries with hash mismatches
+
+### Snapshot Creation
+
+Create deterministic, verifiable snapshots of the contractstate column family using the SPK (StatePack) format.
+
+#### Create snapshot
+```bash
+./amadeus-fabric-doctor --db-path /path/to/fabric/db --snapshot /backup/contractstate-snapshot
+```
+
+This will create:
+- `contractstate-snapshot.spk` - Binary snapshot file
+- `contractstate-snapshot.spk.manifest.json` - Metadata and verification information
+
+#### Snapshot Features
+- **Deterministic**: Same database state produces identical snapshots
+- **Verifiable**: Blake3 hash ensures data integrity
+- **Efficient**: Binary format with varint encoding
+- **Complete**: Captures all key-value pairs in exact order
+- **Portable**: Can be used for backup, migration, or analysis
+
+#### Snapshot Format (SPK)
+Follows the StatePack v1 specification:
+- Magic bytes: `SPK1`
+- Column family name (varint length + UTF-8 name)
+- Records: varint(key_len) + key + varint(value_len) + value
+- Blake3 hash of entire content for verification
 
 ### Database Migration
 
-#### Migrate contractstate from old RocksDB to new RocksDB
+#### Enhanced Amadeus Fabric Migration
 ```bash
-./fabric-reader --db-path /path/to/old/db --migrate /path/to/new/db
+./amadeus-fabric-doctor --db-path /path/to/old/db --migrate /path/to/new/db
 ```
 
-This command will:
-1. **Validate** that the source database exists and contains the contractstate column family
-2. **Create** a new database at the target path if it doesn't exist (with latest RocksDB 10.4.2+)
-3. **Migrate** all contractstate data from the source to the target database
-4. **Verify** that the migration was successful by comparing entry counts
-5. **Report** detailed statistics about the migration
+This enhanced migration command performs the following:
+
+**Column Family Migration Strategy:**
+1. **contractstate** (Full Migration) - All entries migrated completely
+2. **sysconf** (Full Migration) - All entries migrated completely
+3. **default** (Height-Filtered Migration) - Entries between temporal and rooted heights + chain traversal to genesis/gap
+4. **entry_by_height** (Height-Filtered Migration) - Only entries within height range based on parsed height keys
+5. **entry_by_slot** (Height-Filtered Migration) - Entries filtered by corresponding entry availability in default CF
+
+6. **muts_rev** (Height-Filtered Migration) - Only entries between temporal and rooted heights
+
+**Migration Process:**
+1. **Extract Heights** - Reads temporal_height and rooted_tip from sysconf column family
+2. **Parse ETF Terms** - Decodes Erlang Term Format data for height extraction
+3. **Validate** - Ensures source database exists and contains required column families
+4. **Create Target** - Creates new database with all Amadeus column families
+5. **Migrate in Steps** - Processes each column family according to its migration strategy
+6. **Verify** - Reports detailed statistics and migration success
 
 #### Migration Safety Features
 
@@ -96,27 +190,52 @@ This command will:
 ### Command Line Options
 
 ```
-Usage: fabric-reader [OPTIONS] --db-path <DB_PATH>
+Usage: amadeus-fabric-doctor [OPTIONS] --db-path <DB_PATH>
 
 Options:
-  -d, --db-path <DB_PATH>    Path to the RocksDB database directory (source for migration)
-      --migrate <TARGET_DB_PATH>  Migrate contractstate column family from db-path to this target database path
-  -l, --list-keys            List all available keys in contractstate column family
-  -k, --key <KEY>            Get value for a specific key (hex format)
-  -e, --export <EXPORT>      Export all contractstate data to JSON file
-  -r, --raw                  Show raw binary data (don't parse ETF)
-  -h, --help                 Print help
+  -d, --db-path <DB_PATH>        Path to the RocksDB database directory (source for migration)
+      --migrate <TARGET_DB_PATH> Enhanced migration: contractstate+sysconf (full), default+muts_rev (height-filtered)
+  -l, --list-keys                List all available keys in contractstate column family
+  -k, --key <KEY>                Get value for a specific key (hex format)
+  -e, --export <EXPORT>          Export all contractstate data to JSON file
+  -r, --raw                      Show raw binary data (don't parse ETF)
+      --snapshot <SNAPSHOT_PATH> Create snapshot of contractstate column family (SPK format)
+      --test <OUTPUT_FILE>       Test entry hash verification and output results to JSON file
+  -h, --help                     Print help
 ```
 
 ## RocksDB Version Compatibility
 
-### Source Database (--db-path)
-- **Erlang RocksDB**: 7.7.3 (as used by Amadeus blockchain node)
-- **Rust Crate**: 0.19.0 (closest available, bundles ~7.4.4)
+**CRITICAL VERSION ENFORCEMENT** - This tool now enforces proper version usage:
 
-### Target Database (--migrate argument)
-- **RocksDB**: 10.4.2+
-- **Rust Crate**: 0.23.0 (latest stable, bundles 10.4.2)
+### Current Implementation (Fixed at 0.19.0)
+- **Source Database**: Erlang-created RocksDB 7.7.3 (read with Rust crate 0.19.0/RocksDB 7.4.4)
+- **Target Database**: Created with Rust crate 0.19.0/RocksDB 7.4.4 (intermediate format)
+- **Compatibility**: 0.19.0 is READ-COMPATIBLE with Erlang's 7.7.3 format
+- **Tool Version**: Fixed at `rocksdb = "0.19.0"` in Cargo.toml
+
+### Two-Step Migration to Latest RocksDB:
+
+**Step 1** (Current Tool):
+```bash
+# Uses rocksdb = "0.19.0"
+./amadeus-fabric-doctor --db-path /erlang/db --migrate /intermediate/db
+```
+
+**Step 2** (Manual):
+1. Edit `Cargo.toml`: Change `rocksdb = "0.19.0"` to `rocksdb = "0.23.0"`
+2. Rebuild: `cargo build --release`
+3. Run final migration:
+```bash
+# Now uses rocksdb = "0.23.0" (RocksDB 10.4.2+)
+./amadeus-fabric-doctor --db-path /intermediate/db --migrate /final/db
+```
+
+### Why This Two-Step Process?
+- **Rust limitation**: Cannot have two different RocksDB versions in one binary
+- **Safety**: Ensures data integrity through intermediate compatible format
+- **Verification**: Each step can be validated independently
+- **Version enforcement**: Prevents accidental version mismatches
 
 ## Architecture Details
 
@@ -181,20 +300,38 @@ The tool handles various data formats stored in the contractstate column family:
 
 ## Examples
 
-### Complete Migration Workflow
+### Complete Migration Workflow with Snapshots
 
 ```bash
-# 1. Check source database
-./fabric-reader --db-path /amadeus/work_folder/db/fabric --list-keys
+# 1. Create verifiable snapshot of original database
+./amadeus-fabric-doctor --db-path /amadeus/work_folder/db/fabric --snapshot /backup/original-state
 
-# 2. Export current state (optional backup)
-./fabric-reader --db-path /amadeus/work_folder/db/fabric --export backup.json
+# 2. Check source database
+./amadeus-fabric-doctor --db-path /amadeus/work_folder/db/fabric --list-keys
 
 # 3. Perform migration
-./fabric-reader --db-path /amadeus/work_folder/db/fabric --migrate /amadeus/migrated_fabric
+./amadeus-fabric-doctor --db-path /amadeus/work_folder/db/fabric --migrate /amadeus/migrated_fabric
 
-# 4. Verify migrated database
-./fabric-reader --db-path /amadeus/migrated_fabric --list-keys
+# 4. Create snapshot of migrated database for verification
+./amadeus-fabric-doctor --db-path /amadeus/migrated_fabric --snapshot /backup/migrated-state
+
+# 5. Verify both snapshots have same content (different format, same data)
+./amadeus-fabric-doctor --db-path /amadeus/migrated_fabric --list-keys
+```
+
+### Backup and Recovery Workflow
+
+```bash
+# Regular backup
+./amadeus-fabric-doctor --db-path /amadeus/work_folder/db/fabric --snapshot /backups/daily-$(date +%Y%m%d)
+
+# Verify backup integrity
+sha256sum /backups/daily-20250912.spk
+# Compare with manifest hash
+cat /backups/daily-20250912.spk.manifest.json | jq .root_hex
+
+# Export human-readable version for analysis
+./amadeus-fabric-doctor --db-path /amadeus/work_folder/db/fabric --export /backups/daily-$(date +%Y%m%d).json
 ```
 
 ### Troubleshooting

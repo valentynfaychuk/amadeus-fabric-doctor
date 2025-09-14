@@ -26,7 +26,7 @@ cd rocksdb
 make static_lib -j8
 ```
 
-2. Build fabric-reader with system library:
+2. Build amadeus-fabric-doctor with system library:
 ```bash
 export ROCKSDB_LIB_DIR=/path/to/rocksdb
 export ROCKSDB_INCLUDE_DIR=/path/to/rocksdb/include
@@ -53,7 +53,7 @@ Since the Erlang node already has the correct version, we could:
 3. Use unsafe FFI to call the C API
 
 ## Current Implementation Status
-The fabric-reader currently uses the standard rocksdb crate which may have version incompatibilities. For production use with exact version matching, one of the above solutions must be implemented.
+The amadeus-fabric-doctor currently uses the standard rocksdb crate which may have version incompatibilities. For production use with exact version matching, one of the above solutions must be implemented.
 
 ## Version Compatibility Matrix
 | Component | Version | RocksDB | Status |
