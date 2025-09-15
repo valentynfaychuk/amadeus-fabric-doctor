@@ -46,8 +46,8 @@ fn main() -> Result<()> {
     if let Some(target_db_path) = cli.migrate {
         perform_migration(&cli.db_path, &target_db_path)?;
     } else {
-        // Open the database with contractstate column family
-        let db = open_fabric_database(&cli.db_path)?;
+        // Open the database with contractstate column family (read-only for inspection)
+        let db = open_source_database_readonly(&cli.db_path)?;
 
         let contractstate_cf = db
             .cf_handle("contractstate")
@@ -69,9 +69,54 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn open_fabric_database(db_path: &str) -> Result<DB> {
+fn open_source_database_readonly(db_path: &str) -> Result<DB> {
     if !Path::new(db_path).exists() {
-        return Err(anyhow!("Database path does not exist: {}", db_path));
+        return Err(anyhow!("Source database path does not exist: {}", db_path));
+    }
+
+    let mut opts = Options::default();
+    opts.create_if_missing(false);
+
+    // Try to discover existing column families
+    let cf_names = match DB::list_cf(&opts, db_path) {
+        Ok(names) => names,
+        Err(_) => {
+            // Fallback to known column families from the Amadeus codebase
+            vec![
+                "default".to_string(),
+                "entry_by_height|height:entryhash".to_string(),
+                "entry_by_slot|slot:entryhash".to_string(),
+                "tx|txhash:entryhash".to_string(),
+                "tx_account_nonce|account:nonce->txhash".to_string(),
+                "tx_receiver_nonce|receiver:nonce->txhash".to_string(),
+                "my_seen_time_entry|entryhash".to_string(),
+                "my_attestation_for_entry|entryhash".to_string(),
+                "consensus".to_string(),
+                "consensus_by_entryhash|Map<mutationshash,consensus>".to_string(),
+                "contractstate".to_string(),
+                "muts".to_string(),
+                "muts_rev".to_string(),
+                "sysconf".to_string(),
+            ]
+        }
+    };
+
+    println!("Found column families: {:?}", cf_names);
+
+    let cf_descriptors: Vec<_> = cf_names
+        .iter()
+        .map(|name| ColumnFamilyDescriptor::new(name, Options::default()))
+        .collect();
+
+    // CRITICAL: Open in read-only mode to prevent any writes to source database
+    let db = DB::open_cf_descriptors_read_only(&opts, db_path, cf_descriptors, false)?;
+    println!("🔒 Source database opened in READ-ONLY mode");
+    Ok(db)
+}
+
+fn open_target_database_readwrite(db_path: &str) -> Result<DB> {
+    if !Path::new(db_path).exists() {
+        return Err(anyhow!("Target database path does not exist: {}", db_path));
     }
 
     let mut opts = Options::default();
@@ -109,6 +154,7 @@ fn open_fabric_database(db_path: &str) -> Result<DB> {
         .collect();
 
     let db = DB::open_cf_descriptors(&opts, db_path, cf_descriptors)?;
+    println!("📝 Target database opened in READ-WRITE mode");
     Ok(db)
 }
 
@@ -125,9 +171,9 @@ fn perform_migration(source_db_path: &str, target_db_path: &str) -> Result<()> {
 
     // Open source and target databases
     println!("📖 Opening source database...");
-    let source_db = open_fabric_database(source_db_path)?;
+    let source_db = open_source_database_readonly(source_db_path)?;
     println!("🎯 Opening target database...");
-    let target_db = open_fabric_database(target_db_path)?;
+    let target_db = open_target_database_readwrite(target_db_path)?;
 
     // Step 1: Extract temporal and rooted heights from consensus
     let (temporal_height, rooted_height) = extract_heights(&source_db)?;
@@ -140,10 +186,10 @@ fn perform_migration(source_db_path: &str, target_db_path: &str) -> Result<()> {
     migrate_sysconf_full(&source_db, &target_db)?;
 
     // Step 4: Migrate default CF (selective: temporal to rooted + chain to genesis)
-    migrate_default_selective(&source_db, &target_db, temporal_height, rooted_height)?;
+    let migrated_entry_hashes = migrate_default_selective(&source_db, &target_db, temporal_height, rooted_height)?;
 
-    // Step 5: Migrate muts_rev (temporal to rooted region only)
-    migrate_muts_rev_selective(&source_db, &target_db, temporal_height, rooted_height)?;
+    // Step 5: Migrate muts_rev (temporal to rooted region only) using collected entry hashes
+    migrate_muts_rev_optimized(&source_db, &target_db, &migrated_entry_hashes)?;
 
     println!("✅ Comprehensive migration completed successfully!");
     Ok(())
@@ -433,7 +479,7 @@ fn migrate_column_family_full(
     Ok(())
 }
 
-fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u64, rooted_height: u64) -> Result<()> {
+fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u64, rooted_height: u64) -> Result<Vec<Vec<u8>>> {
     println!("🔄 Migrating default CF (selective: temporal to rooted + chain to genesis)...");
 
     let source_default_cf = source_db
@@ -452,43 +498,63 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
     let mut migrated_entries = 0;
     let mut write_batch = rocksdb::WriteBatch::default();
     let batch_size = 1000;
+    let mut migrated_entry_hashes = Vec::new(); // Collect entry hashes for muts_rev migration
 
     // Phase 1: Migrate entries between temporal_height and rooted_height
     println!("📦 Phase 1: Migrating entries from temporal height {} to rooted height {}", temporal_height, rooted_height);
 
-    // Debug: Count total entries in default CF first
-    let total_entries = source_db.iterator_cf(&source_default_cf, rocksdb::IteratorMode::Start)
-        .map(|_| 1).sum::<i32>();
-    println!("  Total entries in default CF: {}", total_entries);
+    // Get source entry_by_height index for efficient lookup
+    let source_entry_by_height_cf = source_db
+        .cf_handle("entry_by_height|height:entryhash")
+        .ok_or_else(|| anyhow!("entry_by_height CF not found in source"))?;
 
-    let iter = source_db.iterator_cf(&source_default_cf, rocksdb::IteratorMode::Start);
-    for item in iter {
-        let (key, value) = item?;
+    // Use index-based lookup instead of full table scan
+    for height in rooted_height..=temporal_height {
+        let height_prefix = format!("{}:", height);
+        println!("  Looking for entries at height {} (prefix: '{}')", height, height_prefix);
 
-        // Parse entry to get height and slot
-        if let Ok((height, slot, entry_hash)) = parse_entry_metadata(&value) {
-            // Check if entry is in the temporal to rooted range
-            if height >= rooted_height && height <= temporal_height {
-                // Add to default CF
-                write_batch.put_cf(&target_default_cf, &key, &value);
 
-                // Add to entry_by_height index (format: "height:hash")
-                let height_key = format!("{}:{}", height, hex::encode(&entry_hash));
-                write_batch.put_cf(&target_entry_by_height_cf, height_key.as_bytes(), &entry_hash);
+        let iter = source_db.iterator_cf(&source_entry_by_height_cf, rocksdb::IteratorMode::From(height_prefix.as_bytes(), rocksdb::Direction::Forward));
+        let mut found_any = false;
+        for item in iter {
+            let (index_key, entry_hash) = item?;
+            found_any = true;
 
-                // Add to entry_by_slot index (format: "slot:hash")
-                let slot_key = format!("{}:{}", slot, hex::encode(&entry_hash));
-                write_batch.put_cf(&target_entry_by_slot_cf, slot_key.as_bytes(), &entry_hash);
+            // Check if we're still in the right height range (binary comparison)
+            let height_prefix_bytes = height_prefix.as_bytes();
+            if !index_key.starts_with(height_prefix_bytes) {
+                break; // Moved past this height
+            }
 
-                migrated_entries += 1;
+            // Get the actual entry from default CF
+            if let Some(entry_data) = source_db.get_cf(&source_default_cf, &entry_hash)? {
+                // Parse entry to get slot (we already know height)
+                if let Ok((_height, slot, computed_hash)) = parse_entry_metadata(&entry_data) {
+                    // Add to default CF
+                    write_batch.put_cf(&target_default_cf, &entry_hash, &entry_data);
 
-                if migrated_entries % batch_size == 0 {
-                    let batch_to_write = std::mem::replace(&mut write_batch, rocksdb::WriteBatch::default());
-                    target_db.write(batch_to_write)?;
-                    println!("📦 Migrated {} entries (Phase 1)...", migrated_entries);
+                    // Add to entry_by_height index (format: "height:hash")
+                    let height_key = format!("{}:{}", height, hex::encode(&computed_hash));
+                    write_batch.put_cf(&target_entry_by_height_cf, height_key.as_bytes(), &computed_hash);
+
+                    // Add to entry_by_slot index (format: "slot:hash")
+                    let slot_key = format!("{}:{}", slot, hex::encode(&computed_hash));
+                    write_batch.put_cf(&target_entry_by_slot_cf, slot_key.as_bytes(), &computed_hash);
+
+                    // Collect entry hash for muts_rev migration
+                    migrated_entry_hashes.push(entry_hash.to_vec());
+
+                    migrated_entries += 1;
+
+                    if migrated_entries % batch_size == 0 {
+                        let batch_to_write = std::mem::replace(&mut write_batch, rocksdb::WriteBatch::default());
+                        target_db.write(batch_to_write)?;
+                        println!("📦 Migrated {} entries (Phase 1)...", migrated_entries);
+                    }
                 }
             }
         }
+
     }
 
     // Phase 2: Migrate chain from rooted_height down to genesis (follow prev_hash chain)
@@ -498,8 +564,8 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
     let mut chain_entries = 0;
 
     loop {
-        // Find entry at current_height
-        if let Some(entry_at_height) = find_entry_at_height(source_db, &source_default_cf, current_height)? {
+        // Find entry at current_height using index (much faster!)
+        if let Some(entry_at_height) = find_entry_at_height_indexed(source_db, &source_entry_by_height_cf, &source_default_cf, current_height)? {
             let (key, value) = entry_at_height;
 
             // Parse entry to get prev_hash and metadata
@@ -514,6 +580,9 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
                 let slot_key = format!("{}:{}", slot, hex::encode(&entry_hash));
                 write_batch.put_cf(&target_entry_by_slot_cf, slot_key.as_bytes(), &entry_hash);
 
+                // Collect entry hash for muts_rev migration
+                migrated_entry_hashes.push(key.to_vec());
+
                 chain_entries += 1;
 
                 if chain_entries % batch_size == 0 {
@@ -523,7 +592,7 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
                 }
 
                 // Get prev_hash to continue chain
-                if let Some(prev_height) = get_prev_height_from_entry(&value)? {
+                if let Some(prev_height) = get_prev_height_from_entry(&value, source_db)? {
                     if prev_height == 0 {
                         println!("📍 Reached genesis at height 0");
                         break;
@@ -554,7 +623,8 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
 
     println!("✅ Default CF migration complete: {} temporal-rooted entries, {} chain entries",
              migrated_entries, chain_entries);
-    Ok(())
+    println!("📊 Collected {} entry hashes for muts_rev migration", migrated_entry_hashes.len());
+    Ok(migrated_entry_hashes)
 }
 
 fn migrate_muts_rev_selective(source_db: &DB, target_db: &DB, temporal_height: u64, rooted_height: u64) -> Result<()> {
@@ -587,6 +657,43 @@ fn migrate_muts_rev_selective(source_db: &DB, target_db: &DB, temporal_height: u
                     target_db.write(batch_to_write)?;
                     println!("📦 Migrated {} muts_rev entries...", count);
                 }
+            }
+        }
+    }
+
+    // Write final batch
+    if !write_batch.is_empty() {
+        target_db.write(write_batch)?;
+    }
+
+    println!("✅ muts_rev migration complete: {} entries", count);
+    Ok(())
+}
+
+fn migrate_muts_rev_optimized(source_db: &DB, target_db: &DB, entry_hashes: &[Vec<u8>]) -> Result<()> {
+    println!("🔄 Migrating muts_rev (optimized - using {} collected entry hashes)...", entry_hashes.len());
+
+    let source_cf = source_db
+        .cf_handle("muts_rev")
+        .ok_or_else(|| anyhow!("muts_rev CF not found in source"))?;
+    let target_cf = target_db
+        .cf_handle("muts_rev")
+        .ok_or_else(|| anyhow!("muts_rev CF not found in target"))?;
+
+    let mut count = 0;
+    let mut write_batch = rocksdb::WriteBatch::default();
+    let batch_size = 1000;
+
+    // Direct lookup for each entry hash - much faster than full table scan!
+    for entry_hash in entry_hashes {
+        if let Some(muts_rev_data) = source_db.get_cf(&source_cf, entry_hash)? {
+            write_batch.put_cf(&target_cf, entry_hash, &muts_rev_data);
+            count += 1;
+
+            if count % batch_size == 0 {
+                let batch_to_write = std::mem::replace(&mut write_batch, rocksdb::WriteBatch::default());
+                target_db.write(batch_to_write)?;
+                println!("📦 Migrated {} muts_rev entries...", count);
             }
         }
     }
@@ -660,44 +767,61 @@ fn parse_entry_metadata(entry_data: &[u8]) -> Result<(u64, u64, Vec<u8>)> {
     }
 }
 
-fn find_entry_at_height(source_db: &DB, source_cf: &impl rocksdb::AsColumnFamilyRef, height: u64) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-    let iter = source_db.iterator_cf(source_cf, rocksdb::IteratorMode::Start);
+fn find_entry_at_height_indexed(
+    source_db: &DB,
+    source_entry_by_height_cf: &impl rocksdb::AsColumnFamilyRef,
+    source_default_cf: &impl rocksdb::AsColumnFamilyRef,
+    height: u64
+) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    // Use the entry_by_height index for O(log n) lookup instead of O(n) scan
+    let height_prefix = format!("{}:", height);
 
+    let iter = source_db.iterator_cf(source_entry_by_height_cf, rocksdb::IteratorMode::From(height_prefix.as_bytes(), rocksdb::Direction::Forward));
     for item in iter {
-        let (key, value) = item?;
+        let (index_key, entry_hash) = item?;
 
-        if let Ok((entry_height, _slot, _hash)) = parse_entry_metadata(&value) {
-            if entry_height == height {
-                return Ok(Some((key.to_vec(), value.to_vec())));
-            }
+        // Check if we're still in the right height range (binary comparison)
+        let height_prefix_bytes = height_prefix.as_bytes();
+        if !index_key.starts_with(height_prefix_bytes) {
+            break; // Moved past this height, no entries found
+        }
+
+        // Get the first entry at this height (there might be multiple, but we just need one for the chain)
+        if let Some(entry_data) = source_db.get_cf(source_default_cf, &entry_hash)? {
+            return Ok(Some((entry_hash.to_vec(), entry_data)));
         }
     }
 
     Ok(None)
 }
 
-fn get_prev_height_from_entry(entry_data: &[u8]) -> Result<Option<u64>> {
+fn get_prev_height_from_entry(entry_data: &[u8], source_db: &DB) -> Result<Option<u64>> {
+    // Parse entry to get header, then extract prev_hash, then lookup prev entry height
     let term = Term::decode(entry_data)?;
-
     if let Term::Map(map) = term {
-        for (key, value) in &map.map {
-            if let Term::Atom(atom) = key {
-                if atom.name == "header" {
-                    if let Term::Binary(binary) = value {
-                        // Parse header to get prev_slot or prev_height
-                        if let Ok(header_term) = Term::decode(&binary.bytes[..]) {
-                            if let Term::Map(header_map) = header_term {
-                                for (hkey, hvalue) in &header_map.map {
-                                    if let Term::Atom(hatom) = hkey {
-                                        // Look for prev_slot which should correspond to previous height
-                                        if hatom.name == "prev_slot" {
-                                            if let Term::BigInteger(big_int) = hvalue {
-                                                let prev_slot: u64 = big_int.value.clone().try_into().unwrap_or(0);
-                                                // In many blockchains, height correlates with slot
-                                                // This is a simplification - may need adjustment
-                                                return Ok(Some(prev_slot.saturating_sub(1)));
-                                            }
-                                        }
+        // Get header binary from entry
+        if let Some(header_data) = map.map.get(&Term::Atom(eetf::Atom::from("header"))) {
+            if let Term::Binary(binary) = header_data {
+                // Parse header to get prev_hash
+                let header_term = Term::decode(&binary.bytes[..])?;
+                if let Term::Map(header_map) = header_term {
+                    if let Some(prev_hash_term) = header_map.map.get(&Term::Atom(eetf::Atom::from("prev_hash"))) {
+                        if let Term::Binary(prev_hash_bin) = prev_hash_term {
+                            if prev_hash_bin.bytes.len() == 32 {
+                                let prev_hash: [u8; 32] = prev_hash_bin.bytes.as_slice().try_into().unwrap();
+
+                                // Special case: all-zero hash means genesis
+                                if prev_hash == [0u8; 32] {
+                                    return Ok(Some(0));
+                                }
+
+                                // Look up previous entry by hash to get its height
+                                let default_cf = source_db.cf_handle("default")
+                                    .ok_or_else(|| anyhow!("default CF not found"))?;
+
+                                if let Some(prev_entry_data) = source_db.get_cf(&default_cf, &prev_hash)? {
+                                    if let Ok((prev_height, _slot, _hash)) = parse_entry_metadata(&prev_entry_data) {
+                                        return Ok(Some(prev_height));
                                     }
                                 }
                             }
@@ -707,7 +831,6 @@ fn get_prev_height_from_entry(entry_data: &[u8]) -> Result<Option<u64>> {
             }
         }
     }
-
     Ok(None)
 }
 
