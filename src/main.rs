@@ -188,8 +188,8 @@ fn perform_migration(source_db_path: &str, target_db_path: &str) -> Result<()> {
     // Step 4: Migrate default CF (selective: temporal to rooted + chain to genesis)
     let migrated_entry_hashes = migrate_default_selective(&source_db, &target_db, temporal_height, rooted_height)?;
 
-    // Step 5: Migrate muts_rev (temporal to rooted region only) using collected entry hashes
-    migrate_muts_rev_optimized(&source_db, &target_db, &migrated_entry_hashes)?;
+    // Step 5: Migrate muts_rev (temporal entries only) using collected temporal entry hashes
+    migrate_muts_rev_selective(&source_db, &target_db, &migrated_entry_hashes)?;
 
     println!("✅ Comprehensive migration completed successfully!");
     Ok(())
@@ -498,7 +498,8 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
     let mut migrated_entries = 0;
     let mut write_batch = rocksdb::WriteBatch::default();
     let batch_size = 1000;
-    let mut migrated_entry_hashes = Vec::new(); // Collect entry hashes for muts_rev migration
+    let mut temporal_entry_hashes = Vec::new(); // Collect ONLY temporal entry hashes for muts_rev migration
+    let mut rooted_entry_hashes = Vec::new(); // Collect rooted entry hashes (for reference, not muts_rev)
 
     // Phase 1: Migrate entries between temporal_height and rooted_height
     println!("📦 Phase 1: Migrating entries from temporal height {} to rooted height {}", temporal_height, rooted_height);
@@ -515,10 +516,8 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
 
 
         let iter = source_db.iterator_cf(&source_entry_by_height_cf, rocksdb::IteratorMode::From(height_prefix.as_bytes(), rocksdb::Direction::Forward));
-        let mut found_any = false;
         for item in iter {
             let (index_key, entry_hash) = item?;
-            found_any = true;
 
             // Check if we're still in the right height range (binary comparison)
             let height_prefix_bytes = height_prefix.as_bytes();
@@ -541,8 +540,8 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
                     let slot_key = format!("{}:{}", slot, hex::encode(&computed_hash));
                     write_batch.put_cf(&target_entry_by_slot_cf, slot_key.as_bytes(), &computed_hash);
 
-                    // Collect entry hash for muts_rev migration
-                    migrated_entry_hashes.push(entry_hash.to_vec());
+                    // Collect temporal entry hash for muts_rev migration
+                    temporal_entry_hashes.push(entry_hash.to_vec());
 
                     migrated_entries += 1;
 
@@ -580,8 +579,8 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
                 let slot_key = format!("{}:{}", slot, hex::encode(&entry_hash));
                 write_batch.put_cf(&target_entry_by_slot_cf, slot_key.as_bytes(), &entry_hash);
 
-                // Collect entry hash for muts_rev migration
-                migrated_entry_hashes.push(key.to_vec());
+                // Collect rooted entry hash (for reference, not muts_rev)
+                rooted_entry_hashes.push(key.to_vec());
 
                 chain_entries += 1;
 
@@ -623,55 +622,13 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
 
     println!("✅ Default CF migration complete: {} temporal-rooted entries, {} chain entries",
              migrated_entries, chain_entries);
-    println!("📊 Collected {} entry hashes for muts_rev migration", migrated_entry_hashes.len());
-    Ok(migrated_entry_hashes)
+    println!("📊 Collected {} temporal entry hashes for muts_rev migration", temporal_entry_hashes.len());
+    println!("📊 Collected {} rooted entry hashes (for reference)", rooted_entry_hashes.len());
+    Ok(temporal_entry_hashes)
 }
 
-fn migrate_muts_rev_selective(source_db: &DB, target_db: &DB, temporal_height: u64, rooted_height: u64) -> Result<()> {
-    println!("🔄 Migrating muts_rev (temporal to rooted height region only)...");
-
-    let source_cf = source_db
-        .cf_handle("muts_rev")
-        .ok_or_else(|| anyhow!("muts_rev CF not found in source"))?;
-    let target_cf = target_db
-        .cf_handle("muts_rev")
-        .ok_or_else(|| anyhow!("muts_rev CF not found in target"))?;
-
-    let iter = source_db.iterator_cf(&source_cf, rocksdb::IteratorMode::Start);
-    let mut count = 0;
-    let mut write_batch = rocksdb::WriteBatch::default();
-    let batch_size = 1000;
-
-    for item in iter {
-        let (key, value) = item?;
-
-        // Parse height from muts_rev key (muts_rev is keyed by entry hash)
-        if let Some(height) = parse_height_from_muts_rev_key(&key, source_db) {
-            // Only migrate if in temporal to rooted range
-            if height >= rooted_height && height <= temporal_height {
-                write_batch.put_cf(&target_cf, &key, &value);
-                count += 1;
-
-                if count % batch_size == 0 {
-                    let batch_to_write = std::mem::replace(&mut write_batch, rocksdb::WriteBatch::default());
-                    target_db.write(batch_to_write)?;
-                    println!("📦 Migrated {} muts_rev entries...", count);
-                }
-            }
-        }
-    }
-
-    // Write final batch
-    if !write_batch.is_empty() {
-        target_db.write(write_batch)?;
-    }
-
-    println!("✅ muts_rev migration complete: {} entries", count);
-    Ok(())
-}
-
-fn migrate_muts_rev_optimized(source_db: &DB, target_db: &DB, entry_hashes: &[Vec<u8>]) -> Result<()> {
-    println!("🔄 Migrating muts_rev (optimized - using {} collected entry hashes)...", entry_hashes.len());
+fn migrate_muts_rev_selective(source_db: &DB, target_db: &DB, temporal_entry_hashes: &[Vec<u8>]) -> Result<()> {
+    println!("🔄 Migrating muts_rev (for temporal entries only)...");
 
     let source_cf = source_db
         .cf_handle("muts_rev")
@@ -683,11 +640,12 @@ fn migrate_muts_rev_optimized(source_db: &DB, target_db: &DB, entry_hashes: &[Ve
     let mut count = 0;
     let mut write_batch = rocksdb::WriteBatch::default();
     let batch_size = 1000;
+    let mut not_found = 0;
 
-    // Direct lookup for each entry hash - much faster than full table scan!
-    for entry_hash in entry_hashes {
-        if let Some(muts_rev_data) = source_db.get_cf(&source_cf, entry_hash)? {
-            write_batch.put_cf(&target_cf, entry_hash, &muts_rev_data);
+    // Process only temporal entry hashes (muts_rev is keyed by entry hash)
+    for entry_hash in temporal_entry_hashes {
+        if let Some(value) = source_db.get_cf(&source_cf, entry_hash)? {
+            write_batch.put_cf(&target_cf, entry_hash, &value);
             count += 1;
 
             if count % batch_size == 0 {
@@ -695,6 +653,8 @@ fn migrate_muts_rev_optimized(source_db: &DB, target_db: &DB, entry_hashes: &[Ve
                 target_db.write(batch_to_write)?;
                 println!("📦 Migrated {} muts_rev entries...", count);
             }
+        } else {
+            not_found += 1;
         }
     }
 
@@ -703,7 +663,10 @@ fn migrate_muts_rev_optimized(source_db: &DB, target_db: &DB, entry_hashes: &[Ve
         target_db.write(write_batch)?;
     }
 
-    println!("✅ muts_rev migration complete: {} entries", count);
+    println!("✅ muts_rev migration complete: {} entries migrated, {} not found in source", count, not_found);
+    if not_found > 0 {
+        println!("ℹ️  {} temporal entries did not have corresponding muts_rev data (this may be normal)", not_found);
+    }
     Ok(())
 }
 
@@ -834,18 +797,6 @@ fn get_prev_height_from_entry(entry_data: &[u8], source_db: &DB) -> Result<Optio
     Ok(None)
 }
 
-fn parse_height_from_muts_rev_key(key: &[u8], source_db: &DB) -> Option<u64> {
-    // muts_rev is keyed by entry hash (as seen in consensus.ex:375)
-    // We need to look up the entry to get its height
-    let default_cf = source_db.cf_handle("default")?;
-
-    if let Some(entry_data) = source_db.get_cf(&default_cf, key).ok()? {
-        if let Ok((height, _slot, _hash)) = parse_entry_metadata(&entry_data) {
-            return Some(height);
-        }
-    }
-    None
-}
 
 fn count_entries(db: &DB, cf: &impl rocksdb::AsColumnFamilyRef) -> Result<usize> {
     let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
