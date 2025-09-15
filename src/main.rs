@@ -3,6 +3,9 @@ use clap::Parser;
 use rocksdb::{ColumnFamilyDescriptor, DB, Options};
 use serde_json::json;
 use std::path::Path;
+use eetf::Term;
+
+mod utils;
 
 #[derive(Parser)]
 #[command(name = "amadeus-fabric-doctor")]
@@ -572,48 +575,117 @@ fn parse_etf_to_json(data: &[u8]) -> Result<serde_json::Value> {
             return Ok(json!(string_val));
         }
     }
-    
+
     // Check if it starts with ETF magic byte (131)
     if data.starts_with(&[131]) {
-        // For now, we'll provide basic ETF structure info rather than full parsing
-        // This is because ETF parsing requires complex handling and the eetf crate
-        // had API compatibility issues
-        let mut etf_info = serde_json::Map::new();
-        etf_info.insert("etf_format".to_string(), json!(true));
-        etf_info.insert("magic_byte".to_string(), json!(131));
-        etf_info.insert("data_size".to_string(), json!(data.len()));
-        etf_info.insert("raw_hex".to_string(), json!(hex::encode(data)));
-        
-        // Try to give some indication of the ETF type
-        if data.len() > 1 {
-            let type_byte = data[1];
-            etf_info.insert("etf_type_byte".to_string(), json!(type_byte));
-            let type_name = match type_byte {
-                70 => "NEW_FLOAT",
-                97 => "SMALL_INTEGER", 
-                98 => "INTEGER",
-                100 => "ATOM",
-                104 => "SMALL_TUPLE",
-                105 => "LARGE_TUPLE",
-                106 => "NIL",
-                107 => "STRING",
-                108 => "LIST",
-                109 => "BINARY",
-                116 => "MAP",
-                _ => "UNKNOWN"
-            };
-            etf_info.insert("etf_type".to_string(), json!(type_name));
+        // Try to parse with eetf crate
+        match Term::decode(data) {
+            Ok(term) => {
+                // Convert ETF term to JSON
+                return etf_term_to_json(&term);
+            }
+            Err(e) => {
+                // If parsing fails, return error info with basic ETF structure
+                let mut etf_info = serde_json::Map::new();
+                etf_info.insert("etf_format".to_string(), json!(true));
+                etf_info.insert("parse_error".to_string(), json!(format!("{}", e)));
+                etf_info.insert("magic_byte".to_string(), json!(131));
+                etf_info.insert("data_size".to_string(), json!(data.len()));
+                etf_info.insert("raw_hex".to_string(), json!(hex::encode(data)));
+
+                // Try to give some indication of the ETF type
+                if data.len() > 1 {
+                    let type_byte = data[1];
+                    etf_info.insert("etf_type_byte".to_string(), json!(type_byte));
+                    let type_name = match type_byte {
+                        70 => "NEW_FLOAT",
+                        97 => "SMALL_INTEGER",
+                        98 => "INTEGER",
+                        100 => "ATOM",
+                        104 => "SMALL_TUPLE",
+                        105 => "LARGE_TUPLE",
+                        106 => "NIL",
+                        107 => "STRING",
+                        108 => "LIST",
+                        109 => "BINARY",
+                        116 => "MAP",
+                        119 => "SMALL_ATOM",
+                        _ => "UNKNOWN"
+                    };
+                    etf_info.insert("etf_type".to_string(), json!(type_name));
+                }
+
+                return Ok(json!(etf_info));
+            }
         }
-        
-        return Ok(json!(etf_info));
     }
-    
+
     // If not ETF and not valid UTF-8, return as hex
     Ok(json!({
         "raw_hex": hex::encode(data),
         "size_bytes": data.len(),
         "note": "Binary data, not ETF format"
     }))
+}
+
+fn etf_term_to_json(term: &Term) -> Result<serde_json::Value> {
+    match term {
+        Term::Atom(atom) => Ok(json!(atom.name)),
+        Term::FixInteger(int) => Ok(json!(int.value)),
+        Term::BigInteger(big_int) => Ok(json!(big_int.value.to_string())),
+        Term::Float(float) => Ok(json!(float.value)),
+        Term::Binary(binary) => {
+            // Try to decode as UTF-8 string first
+            if let Ok(s) = std::str::from_utf8(&binary.bytes) {
+                Ok(json!(s))
+            } else {
+                Ok(json!(hex::encode(&binary.bytes)))
+            }
+        }
+        Term::List(list) => {
+            let mut json_list = Vec::new();
+            for element in &list.elements {
+                json_list.push(etf_term_to_json(element)?);
+            }
+            Ok(json!(json_list))
+        }
+        Term::Tuple(tuple) => {
+            let mut json_tuple = Vec::new();
+            for element in &tuple.elements {
+                json_tuple.push(etf_term_to_json(element)?);
+            }
+            Ok(json!(json_tuple))
+        }
+        Term::Map(map) => {
+            let mut json_map = serde_json::Map::new();
+            for (key, value) in &map.map {
+                let key_str = match key {
+                    Term::Atom(atom) => atom.name.clone(),
+                    Term::Binary(binary) => {
+                        if let Ok(s) = std::str::from_utf8(&binary.bytes) {
+                            s.to_string()
+                        } else {
+                            format!("binary:{}", hex::encode(&binary.bytes))
+                        }
+                    }
+                    _ => format!("{:?}", key),
+                };
+                json_map.insert(key_str, etf_term_to_json(value)?);
+            }
+            Ok(json!(json_map))
+        }
+        Term::ByteList(byte_list) => {
+            if let Ok(s) = std::str::from_utf8(&byte_list.bytes) {
+                Ok(json!(s))
+            } else {
+                Ok(json!(hex::encode(&byte_list.bytes)))
+            }
+        }
+        _ => {
+            // For other types (Pid, Port, Reference, etc.), return debug representation
+            Ok(json!(format!("{:?}", term)))
+        }
+    }
 }
 
 fn test_entry_hash_verification(db: &DB, output_file: &str) -> Result<()> {
@@ -733,82 +805,54 @@ fn test_single_entry_hash(entry_key: &[u8], entry_packed: &[u8]) -> Result<(bool
 }
 
 fn extract_hash_from_entry(entry_packed: &[u8]) -> Result<Vec<u8>> {
-    // This is a simplified approach - in reality we'd need a full ETF parser
-    // For now, we'll search for a 32-byte hash field in the binary data
+    // Parse the ETF entry and extract the hash field
+    let term = Term::decode(entry_packed)?;
 
-    // Look for patterns that might be the hash field
-    // ETF binaries are encoded with length prefixes, so we look for byte sequences
-    // that could represent a 32-byte hash
-
-    // Search for potential 32-byte sequences (Blake3 hash size)
-    for i in 10..entry_packed.len().saturating_sub(32) {
-        // Look for what could be a hash - 32 consecutive bytes that look random
-        let potential_hash = &entry_packed[i..i+32];
-
-        // Basic heuristic: if it's not all zeros and not all 0xFF, it might be a hash
-        if !potential_hash.iter().all(|&b| b == 0) &&
-           !potential_hash.iter().all(|&b| b == 0xFF) &&
-           potential_hash.iter().any(|&b| b != potential_hash[0]) {
-            return Ok(potential_hash.to_vec());
+    if let Term::Map(map) = term {
+        // Look for the "hash" field in the entry map
+        for (key, value) in &map.map {
+            if let Term::Atom(atom) = key {
+                if atom.name == "hash" {
+                    if let Term::Binary(binary) = value {
+                        return Ok(binary.bytes.clone());
+                    }
+                }
+            }
         }
+        return Err(anyhow!("No 'hash' field found in entry map"));
     }
 
-    Err(anyhow!("Could not extract hash from entry"))
+    Err(anyhow!("Entry is not an ETF map"))
 }
 
 fn compute_entry_hash(entry_packed: &[u8]) -> Result<Vec<u8>> {
-    // Based on the Elixir code in entry.ex, the hash is computed as:
-    // Blake3.hash(:erlang.term_to_binary(entry_unpacked.header_unpacked, [:deterministic]))
+    // Parse the ETF entry and extract the header binary
+    let header_bin = extract_header_binary_from_entry(entry_packed)?;
 
-    // For a proper implementation, we would:
-    // 1. Parse the ETF entry to extract header_unpacked
-    // 2. Re-encode it deterministically
-    // 3. Compute Blake3 hash
-
-    // For now, we'll implement a simplified version that attempts to find and hash the header
-    let header_bytes = extract_header_from_entry(entry_packed)?;
-
-    // Compute Blake3 hash
-    // Note: We would need to add blake3 crate to Cargo.toml for this to work
-    // For now, we'll use a placeholder that returns a computed hash
-    Ok(compute_placeholder_hash(&header_bytes))
+    // Compute Blake3 hash of the header binary
+    // This matches the rs_node implementation: blake3::hash(&self.header_bin)
+    let hash = blake3::hash(&header_bin);
+    Ok(hash.as_bytes().to_vec())
 }
 
-fn extract_header_from_entry(entry_packed: &[u8]) -> Result<Vec<u8>> {
-    // This is a simplified header extraction
-    // In reality, we'd need to properly parse the ETF structure
+fn extract_header_binary_from_entry(entry_packed: &[u8]) -> Result<Vec<u8>> {
+    // Parse the ETF entry and extract the header binary field
+    let term = Term::decode(entry_packed)?;
 
-    // Look for what might be the header field in the ETF data
-    // The entry should be a map with fields like :header, :txs, :hash, :signature
-
-    // For now, return a portion of the entry data as a placeholder
-    // This is not the correct implementation but serves as a starting point
-    if entry_packed.len() > 100 {
-        Ok(entry_packed[10..50].to_vec())
-    } else {
-        Err(anyhow!("Entry too small to extract header"))
-    }
-}
-
-fn compute_placeholder_hash(data: &[u8]) -> Vec<u8> {
-    // Placeholder for Blake3 hash computation
-    // In a real implementation, this would use the blake3 crate:
-    // blake3::hash(data).as_bytes().to_vec()
-
-    // For now, we'll return a simple hash as a placeholder
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
-    let hash_u64 = hasher.finish();
-
-    // Convert to 32-byte array (Blake3 size) by repeating the u64
-    let mut result = vec![0u8; 32];
-    for i in 0..4 {
-        let bytes = (hash_u64.wrapping_mul(i as u64 + 1)).to_le_bytes();
-        result[i*8..(i+1)*8].copy_from_slice(&bytes);
+    if let Term::Map(map) = term {
+        // Look for the "header" field in the entry map
+        for (key, value) in &map.map {
+            if let Term::Atom(atom) = key {
+                if atom.name == "header" {
+                    if let Term::Binary(binary) = value {
+                        return Ok(binary.bytes.clone());
+                    }
+                }
+            }
+        }
+        return Err(anyhow!("No 'header' field found in entry map"));
     }
 
-    result
+    Err(anyhow!("Entry is not an ETF map"))
 }
+
