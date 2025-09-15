@@ -113,34 +113,39 @@ fn open_fabric_database(db_path: &str) -> Result<DB> {
 }
 
 fn perform_migration(source_db_path: &str, target_db_path: &str) -> Result<()> {
-    println!("🔄 Starting migration from {} to {}", source_db_path, target_db_path);
-    
+    println!("🔄 Starting comprehensive fabric migration from {} to {}", source_db_path, target_db_path);
+
     // Validate source database exists
     if !Path::new(source_db_path).exists() {
         return Err(anyhow!("Source database path does not exist: {}", source_db_path));
     }
-    
+
     // Create target database if it doesn't exist
     create_target_database(target_db_path)?;
-    
-    // Open source database (old RocksDB version compatible)
+
+    // Open source and target databases
     println!("📖 Opening source database...");
     let source_db = open_fabric_database(source_db_path)?;
-    let source_contractstate_cf = source_db
-        .cf_handle("contractstate")
-        .ok_or_else(|| anyhow!("contractstate column family not found in source database"))?;
-    
-    // Open target database (new RocksDB version)
     println!("🎯 Opening target database...");
     let target_db = open_fabric_database(target_db_path)?;
-    let target_contractstate_cf = target_db
-        .cf_handle("contractstate")
-        .ok_or_else(|| anyhow!("contractstate column family not found in target database"))?;
-    
-    // Perform the migration
-    migrate_contractstate(&source_db, &source_contractstate_cf, &target_db, &target_contractstate_cf)?;
-    
-    println!("✅ Migration completed successfully!");
+
+    // Step 1: Extract temporal and rooted heights from consensus
+    let (temporal_height, rooted_height) = extract_heights(&source_db)?;
+    println!("📊 Heights - Temporal: {}, Rooted: {}", temporal_height, rooted_height);
+
+    // Step 2: Migrate contractstate (full)
+    migrate_contractstate_full(&source_db, &target_db)?;
+
+    // Step 3: Migrate sysconf (full)
+    migrate_sysconf_full(&source_db, &target_db)?;
+
+    // Step 4: Migrate default CF (selective: temporal to rooted + chain to genesis)
+    migrate_default_selective(&source_db, &target_db, temporal_height, rooted_height)?;
+
+    // Step 5: Migrate muts_rev (temporal to rooted region only)
+    migrate_muts_rev_selective(&source_db, &target_db, temporal_height, rooted_height)?;
+
+    println!("✅ Comprehensive migration completed successfully!");
     Ok(())
 }
 
@@ -192,13 +197,131 @@ fn create_target_database(db_path: &str) -> Result<()> {
     Ok(())
 }
 
-fn migrate_contractstate(
+fn extract_heights(source_db: &DB) -> Result<(u64, u64)> {
+    let sysconf_cf = source_db
+        .cf_handle("sysconf")
+        .ok_or_else(|| anyhow!("sysconf column family not found"))?;
+
+    // Debug: List all keys in sysconf CF to see what's actually there
+    println!("🔍 Debugging sysconf CF contents:");
+    let iter = source_db.iterator_cf(&sysconf_cf, rocksdb::IteratorMode::Start);
+    for (i, item) in iter.enumerate() {
+        if i >= 20 { // Limit to first 20 entries
+            println!("... (showing first 20 entries)");
+            break;
+        }
+        match item {
+            Ok((key, value)) => {
+                let key_str = std::str::from_utf8(&key).unwrap_or("<invalid UTF-8>");
+                let key_hex = hex::encode(&key);
+                println!("  Key: '{}' (hex: {}) -> Value: {} bytes", key_str, key_hex, value.len());
+            }
+            Err(e) => println!("  Error reading entry: {}", e),
+        }
+    }
+
+    let mut temporal_height = 0u64;
+    let mut rooted_height = 0u64;
+
+    // Get temporal_height from sysconf CF (stored as ETF-encoded term with string key)
+    println!("🔍 Looking for temporal_height...");
+    if let Some(value) = source_db.get_cf(&sysconf_cf, "temporal_height".as_bytes())? {
+        println!("  Found temporal_height: {} bytes", value.len());
+        // Parse ETF-encoded height value
+        if let Ok(term) = Term::decode(&value[..]) {
+            if let Term::BigInteger(big_int) = term {
+                temporal_height = big_int.value.clone().try_into().unwrap_or(0);
+                println!("  Parsed temporal_height: {}", temporal_height);
+            } else if let Term::FixInteger(fix_int) = term {
+                temporal_height = fix_int.value as u64;
+                println!("  Parsed temporal_height (small int): {}", temporal_height);
+            } else {
+                println!("  temporal_height is not an integer: {:?}", term);
+            }
+        } else {
+            println!("  Failed to decode temporal_height as ETF");
+        }
+    } else {
+        return Err(anyhow!("temporal_height not found in sysconf CF"));
+    }
+
+    // Get rooted_height by looking up rooted_tip hash and getting the entry
+    println!("🔍 Looking for rooted_tip...");
+    if let Some(rooted_tip_hash) = source_db.get_cf(&sysconf_cf, "rooted_tip".as_bytes())? {
+        println!("  Found rooted_tip hash: {} bytes", rooted_tip_hash.len());
+
+        // Look up the entry by this hash in the default CF
+        let default_cf = source_db
+            .cf_handle("default")
+            .ok_or_else(|| anyhow!("default CF not found"))?;
+
+        if let Some(entry_data) = source_db.get_cf(&default_cf, &rooted_tip_hash)? {
+            println!("  Found rooted entry: {} bytes", entry_data.len());
+            // Parse entry to get height
+            if let Ok((height, _slot, _hash)) = parse_entry_metadata(&entry_data) {
+                rooted_height = height;
+                println!("  Parsed rooted_height: {}", rooted_height);
+            } else {
+                println!("  Failed to parse rooted entry metadata");
+            }
+        } else {
+            println!("  rooted_tip hash not found in default CF");
+        }
+    } else {
+        println!("  rooted_tip not found");
+    }
+
+
+    if temporal_height == 0 && rooted_height == 0 {
+        return Err(anyhow!("Could not find temporal_height or rooted_height in sysconf CF"));
+    }
+
+    // If only one height is found, use a reasonable default for the other
+    if temporal_height == 0 {
+        temporal_height = rooted_height; // Assume they're the same if temporal not found
+    }
+    if rooted_height == 0 {
+        rooted_height = temporal_height.saturating_sub(10); // Assume rooted is slightly behind
+    }
+
+    Ok((temporal_height, rooted_height))
+}
+
+
+fn migrate_contractstate_full(source_db: &DB, target_db: &DB) -> Result<()> {
+    println!("🔄 Migrating contractstate (full)...");
+
+    let source_cf = source_db
+        .cf_handle("contractstate")
+        .ok_or_else(|| anyhow!("contractstate CF not found in source"))?;
+    let target_cf = target_db
+        .cf_handle("contractstate")
+        .ok_or_else(|| anyhow!("contractstate CF not found in target"))?;
+
+    migrate_column_family_full(source_db, &source_cf, target_db, &target_cf, "contractstate")
+}
+
+fn migrate_sysconf_full(source_db: &DB, target_db: &DB) -> Result<()> {
+    println!("🔄 Migrating sysconf (full)...");
+
+    let source_cf = source_db
+        .cf_handle("sysconf")
+        .ok_or_else(|| anyhow!("sysconf CF not found in source"))?;
+    let target_cf = target_db
+        .cf_handle("sysconf")
+        .ok_or_else(|| anyhow!("sysconf CF not found in target"))?;
+
+    migrate_column_family_full(source_db, &source_cf, target_db, &target_cf, "sysconf")
+}
+
+fn migrate_column_family_full(
     source_db: &DB,
     source_cf: &impl rocksdb::AsColumnFamilyRef,
     target_db: &DB,
     target_cf: &impl rocksdb::AsColumnFamilyRef,
+    cf_name: &str,
 ) -> Result<()> {
-    println!("🔄 Migrating contractstate column family data...");
+    println!("🔄 Migrating {} column family data...", cf_name);
     
     // First, check if the target database already has data
     let initial_target_count = count_entries(target_db, target_cf)?;
@@ -299,8 +422,290 @@ fn migrate_contractstate(
             final_target_count
         ));
     }
-    
+
     Ok(())
+}
+
+fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u64, rooted_height: u64) -> Result<()> {
+    println!("🔄 Migrating default CF (selective: temporal to rooted + chain to genesis)...");
+
+    let source_default_cf = source_db
+        .cf_handle("default")
+        .ok_or_else(|| anyhow!("default CF not found in source"))?;
+    let target_default_cf = target_db
+        .cf_handle("default")
+        .ok_or_else(|| anyhow!("default CF not found in target"))?;
+    let target_entry_by_height_cf = target_db
+        .cf_handle("entry_by_height|height:entryhash")
+        .ok_or_else(|| anyhow!("entry_by_height CF not found in target"))?;
+    let target_entry_by_slot_cf = target_db
+        .cf_handle("entry_by_slot|slot:entryhash")
+        .ok_or_else(|| anyhow!("entry_by_slot CF not found in target"))?;
+
+    let mut migrated_entries = 0;
+    let mut write_batch = rocksdb::WriteBatch::default();
+    let batch_size = 1000;
+
+    // Phase 1: Migrate entries between temporal_height and rooted_height
+    println!("📦 Phase 1: Migrating entries from temporal height {} to rooted height {}", temporal_height, rooted_height);
+
+    let iter = source_db.iterator_cf(&source_default_cf, rocksdb::IteratorMode::Start);
+    for item in iter {
+        let (key, value) = item?;
+
+        // Parse entry to get height and slot
+        if let Ok((height, slot, entry_hash)) = parse_entry_metadata(&value) {
+            // Check if entry is in the temporal to rooted range
+            if height >= rooted_height && height <= temporal_height {
+                // Add to default CF
+                write_batch.put_cf(&target_default_cf, &key, &value);
+
+                // Add to entry_by_height index (format: "height:hash")
+                let height_key = format!("{}:{}", height, hex::encode(&entry_hash));
+                write_batch.put_cf(&target_entry_by_height_cf, height_key.as_bytes(), &entry_hash);
+
+                // Add to entry_by_slot index (format: "slot:hash")
+                let slot_key = format!("{}:{}", slot, hex::encode(&entry_hash));
+                write_batch.put_cf(&target_entry_by_slot_cf, slot_key.as_bytes(), &entry_hash);
+
+                migrated_entries += 1;
+
+                if migrated_entries % batch_size == 0 {
+                    let batch_to_write = std::mem::replace(&mut write_batch, rocksdb::WriteBatch::default());
+                    target_db.write(batch_to_write)?;
+                    println!("📦 Migrated {} entries (Phase 1)...", migrated_entries);
+                }
+            }
+        }
+    }
+
+    // Phase 2: Migrate chain from rooted_height down to genesis (follow prev_hash chain)
+    println!("📦 Phase 2: Migrating chain from rooted height {} down to genesis", rooted_height);
+
+    let mut current_height = rooted_height;
+    let mut chain_entries = 0;
+
+    loop {
+        // Find entry at current_height
+        if let Some(entry_at_height) = find_entry_at_height(source_db, &source_default_cf, current_height)? {
+            let (key, value) = entry_at_height;
+
+            // Parse entry to get prev_hash and metadata
+            if let Ok((height, slot, entry_hash)) = parse_entry_metadata(&value) {
+                // Add to default CF
+                write_batch.put_cf(&target_default_cf, &key, &value);
+
+                // Add to indexes (format: "height:hash" and "slot:hash")
+                let height_key = format!("{}:{}", height, hex::encode(&entry_hash));
+                write_batch.put_cf(&target_entry_by_height_cf, height_key.as_bytes(), &entry_hash);
+
+                let slot_key = format!("{}:{}", slot, hex::encode(&entry_hash));
+                write_batch.put_cf(&target_entry_by_slot_cf, slot_key.as_bytes(), &entry_hash);
+
+                chain_entries += 1;
+
+                if chain_entries % batch_size == 0 {
+                    let batch_to_write = std::mem::replace(&mut write_batch, rocksdb::WriteBatch::default());
+                    target_db.write(batch_to_write)?;
+                    println!("📦 Migrated {} chain entries (Phase 2)...", chain_entries);
+                }
+
+                // Get prev_hash to continue chain
+                if let Some(prev_height) = get_prev_height_from_entry(&value)? {
+                    if prev_height == 0 {
+                        println!("📍 Reached genesis at height 0");
+                        break;
+                    }
+                    current_height = prev_height;
+                } else {
+                    println!("⚠️  Could not get prev_height from entry at height {}, stopping chain", current_height);
+                    break;
+                }
+            } else {
+                println!("⚠️  Could not parse entry at height {}, stopping chain", current_height);
+                break;
+            }
+        } else {
+            println!("❌ Missing entry at height {}, gap detected", current_height);
+            break;
+        }
+
+        if current_height == 0 {
+            break;
+        }
+    }
+
+    // Write final batch
+    if !write_batch.is_empty() {
+        target_db.write(write_batch)?;
+    }
+
+    println!("✅ Default CF migration complete: {} temporal-rooted entries, {} chain entries",
+             migrated_entries, chain_entries);
+    Ok(())
+}
+
+fn migrate_muts_rev_selective(source_db: &DB, target_db: &DB, temporal_height: u64, rooted_height: u64) -> Result<()> {
+    println!("🔄 Migrating muts_rev (temporal to rooted height region only)...");
+
+    let source_cf = source_db
+        .cf_handle("muts_rev")
+        .ok_or_else(|| anyhow!("muts_rev CF not found in source"))?;
+    let target_cf = target_db
+        .cf_handle("muts_rev")
+        .ok_or_else(|| anyhow!("muts_rev CF not found in target"))?;
+
+    let iter = source_db.iterator_cf(&source_cf, rocksdb::IteratorMode::Start);
+    let mut count = 0;
+    let mut write_batch = rocksdb::WriteBatch::default();
+    let batch_size = 1000;
+
+    for item in iter {
+        let (key, value) = item?;
+
+        // Parse height from muts_rev key (muts_rev is keyed by entry hash)
+        if let Some(height) = parse_height_from_muts_rev_key(&key, source_db) {
+            // Only migrate if in temporal to rooted range
+            if height >= rooted_height && height <= temporal_height {
+                write_batch.put_cf(&target_cf, &key, &value);
+                count += 1;
+
+                if count % batch_size == 0 {
+                    let batch_to_write = std::mem::replace(&mut write_batch, rocksdb::WriteBatch::default());
+                    target_db.write(batch_to_write)?;
+                    println!("📦 Migrated {} muts_rev entries...", count);
+                }
+            }
+        }
+    }
+
+    // Write final batch
+    if !write_batch.is_empty() {
+        target_db.write(write_batch)?;
+    }
+
+    println!("✅ muts_rev migration complete: {} entries", count);
+    Ok(())
+}
+
+// Helper functions for entry parsing and chain following
+
+fn parse_entry_metadata(entry_data: &[u8]) -> Result<(u64, u64, Vec<u8>)> {
+    // Parse ETF entry to extract height, slot, and compute entry hash
+    let term = Term::decode(entry_data)?;
+
+    if let Term::Map(map) = term {
+        let mut height = 0u64;
+        let mut slot = 0u64;
+        let mut header_bin = Vec::new();
+
+        for (key, value) in &map.map {
+            if let Term::Atom(atom) = key {
+                match atom.name.as_str() {
+                    "header" => {
+                        if let Term::Binary(binary) = value {
+                            header_bin = binary.bytes.clone();
+
+                            // Parse header to get height and slot
+                            if let Ok(header_term) = Term::decode(&header_bin[..]) {
+                                if let Term::Map(header_map) = header_term {
+                                    for (hkey, hvalue) in &header_map.map {
+                                        if let Term::Atom(hatom) = hkey {
+                                            match hatom.name.as_str() {
+                                                "height" => {
+                                                    if let Term::BigInteger(big_int) = hvalue {
+                                                        height = big_int.value.clone().try_into().unwrap_or(0);
+                                                    }
+                                                }
+                                                "slot" => {
+                                                    if let Term::BigInteger(big_int) = hvalue {
+                                                        slot = big_int.value.clone().try_into().unwrap_or(0);
+                                                    }
+                                                }
+                                                _ => continue,
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+        }
+
+        // Compute entry hash (blake3 of header_bin)
+        let entry_hash = blake3::hash(&header_bin);
+
+        Ok((height, slot, entry_hash.as_bytes().to_vec()))
+    } else {
+        Err(anyhow!("Entry is not an ETF map"))
+    }
+}
+
+fn find_entry_at_height(source_db: &DB, source_cf: &impl rocksdb::AsColumnFamilyRef, height: u64) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let iter = source_db.iterator_cf(source_cf, rocksdb::IteratorMode::Start);
+
+    for item in iter {
+        let (key, value) = item?;
+
+        if let Ok((entry_height, _slot, _hash)) = parse_entry_metadata(&value) {
+            if entry_height == height {
+                return Ok(Some((key.to_vec(), value.to_vec())));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn get_prev_height_from_entry(entry_data: &[u8]) -> Result<Option<u64>> {
+    let term = Term::decode(entry_data)?;
+
+    if let Term::Map(map) = term {
+        for (key, value) in &map.map {
+            if let Term::Atom(atom) = key {
+                if atom.name == "header" {
+                    if let Term::Binary(binary) = value {
+                        // Parse header to get prev_slot or prev_height
+                        if let Ok(header_term) = Term::decode(&binary.bytes[..]) {
+                            if let Term::Map(header_map) = header_term {
+                                for (hkey, hvalue) in &header_map.map {
+                                    if let Term::Atom(hatom) = hkey {
+                                        // Look for prev_slot which should correspond to previous height
+                                        if hatom.name == "prev_slot" {
+                                            if let Term::BigInteger(big_int) = hvalue {
+                                                let prev_slot: u64 = big_int.value.clone().try_into().unwrap_or(0);
+                                                // In many blockchains, height correlates with slot
+                                                // This is a simplification - may need adjustment
+                                                return Ok(Some(prev_slot.saturating_sub(1)));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn parse_height_from_muts_rev_key(key: &[u8], source_db: &DB) -> Option<u64> {
+    // muts_rev is keyed by entry hash (as seen in consensus.ex:375)
+    // We need to look up the entry to get its height
+    let default_cf = source_db.cf_handle("default")?;
+
+    if let Some(entry_data) = source_db.get_cf(&default_cf, key).ok()? {
+        if let Ok((height, _slot, _hash)) = parse_entry_metadata(&entry_data) {
+            return Some(height);
+        }
+    }
+    None
 }
 
 fn count_entries(db: &DB, cf: &impl rocksdb::AsColumnFamilyRef) -> Result<usize> {

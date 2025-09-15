@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use eetf::Term;
 use std::cmp::Ordering;
 
