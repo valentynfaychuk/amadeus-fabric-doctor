@@ -258,11 +258,18 @@ fn extract_heights(source_db: &DB) -> Result<(u64, u64)> {
         if let Some(entry_data) = source_db.get_cf(&default_cf, &rooted_tip_hash)? {
             println!("  Found rooted entry: {} bytes", entry_data.len());
             // Parse entry to get height
-            if let Ok((height, _slot, _hash)) = parse_entry_metadata(&entry_data) {
-                rooted_height = height;
-                println!("  Parsed rooted_height: {}", rooted_height);
-            } else {
-                println!("  Failed to parse rooted entry metadata");
+            match parse_entry_metadata(&entry_data) {
+                Ok((height, slot, _hash)) => {
+                    rooted_height = height;
+                    println!("  Parsed rooted_height: {}, slot: {}", rooted_height, slot);
+                }
+                Err(e) => {
+                    println!("  Failed to parse rooted entry metadata: {}", e);
+                    // Try to decode just the top-level structure for debugging
+                    if let Ok(term) = Term::decode(&entry_data[..]) {
+                        println!("  Entry top-level structure: {:?}", term);
+                    }
+                }
             }
         } else {
             println!("  rooted_tip hash not found in default CF");
@@ -449,6 +456,11 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
     // Phase 1: Migrate entries between temporal_height and rooted_height
     println!("📦 Phase 1: Migrating entries from temporal height {} to rooted height {}", temporal_height, rooted_height);
 
+    // Debug: Count total entries in default CF first
+    let total_entries = source_db.iterator_cf(&source_default_cf, rocksdb::IteratorMode::Start)
+        .map(|_| 1).sum::<i32>();
+    println!("  Total entries in default CF: {}", total_entries);
+
     let iter = source_db.iterator_cf(&source_default_cf, rocksdb::IteratorMode::Start);
     for item in iter {
         let (key, value) = item?;
@@ -615,11 +627,15 @@ fn parse_entry_metadata(entry_data: &[u8]) -> Result<(u64, u64, Vec<u8>)> {
                                                 "height" => {
                                                     if let Term::BigInteger(big_int) = hvalue {
                                                         height = big_int.value.clone().try_into().unwrap_or(0);
+                                                    } else if let Term::FixInteger(fix_int) = hvalue {
+                                                        height = fix_int.value as u64;
                                                     }
                                                 }
                                                 "slot" => {
                                                     if let Term::BigInteger(big_int) = hvalue {
                                                         slot = big_int.value.clone().try_into().unwrap_or(0);
+                                                    } else if let Term::FixInteger(fix_int) = hvalue {
+                                                        slot = fix_int.value as u64;
                                                     }
                                                 }
                                                 _ => continue,
