@@ -19,6 +19,10 @@ struct Cli {
     #[arg(long, value_name = "TARGET_DB_PATH")]
     migrate: Option<String>,
 
+    /// Migrate only contractstate and sysconf column families from db-path to this target database path
+    #[arg(long, value_name = "TARGET_DB_PATH")]
+    weakmigrate: Option<String>,
+
     /// List all available keys in contractstate column family
     #[arg(short, long)]
     list_keys: bool,
@@ -45,6 +49,8 @@ fn main() -> Result<()> {
 
     if let Some(target_db_path) = cli.migrate {
         perform_migration(&cli.db_path, &target_db_path)?;
+    } else if let Some(target_db_path) = cli.weakmigrate {
+        perform_weak_migration(&cli.db_path, &target_db_path)?;
     } else {
         // Open the database with contractstate column family (read-only for inspection)
         let db = open_source_database_readonly(&cli.db_path)?;
@@ -192,6 +198,33 @@ fn perform_migration(source_db_path: &str, target_db_path: &str) -> Result<()> {
     migrate_muts_rev_selective(&source_db, &target_db, &migrated_entry_hashes)?;
 
     println!("✅ Comprehensive migration completed successfully!");
+    Ok(())
+}
+
+fn perform_weak_migration(source_db_path: &str, target_db_path: &str) -> Result<()> {
+    println!("🔄 Starting weak migration (contractstate + sysconf only) from {} to {}", source_db_path, target_db_path);
+
+    // Validate source database exists
+    if !Path::new(source_db_path).exists() {
+        return Err(anyhow!("Source database path does not exist: {}", source_db_path));
+    }
+
+    // Create target database if it doesn't exist
+    create_target_database(target_db_path)?;
+
+    // Open source and target databases
+    println!("📖 Opening source database...");
+    let source_db = open_source_database_readonly(source_db_path)?;
+    println!("🎯 Opening target database...");
+    let target_db = open_target_database_readwrite(target_db_path)?;
+
+    // Migrate contractstate (full)
+    migrate_contractstate_full(&source_db, &target_db)?;
+
+    // Migrate sysconf (full)
+    migrate_sysconf_full(&source_db, &target_db)?;
+
+    println!("✅ Weak migration completed successfully!");
     Ok(())
 }
 
@@ -375,11 +408,11 @@ fn migrate_column_family_full(
     cf_name: &str,
 ) -> Result<()> {
     println!("🔄 Migrating {} column family data...", cf_name);
-    
+
     // First, check if the target database already has data
-    let initial_target_count = count_entries(target_db, target_cf)?;
+    let initial_target_count = count_kvs(target_db, target_cf)?;
     if initial_target_count > 0 {
-        println!("⚠️  Target database already contains {} entries. Continue? (y/N)", initial_target_count);
+        println!("⚠️  Target database already contains {} kvs. Continue? (y/N)", initial_target_count);
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         if input.trim().to_lowercase() != "y" && input.trim().to_lowercase() != "yes" {
@@ -423,7 +456,7 @@ fn migrate_column_family_full(
                     match target_db.write(batch_to_write) {
                         Ok(_) => {
                             batch_size = 0;
-                            println!("📦 Migrated {} entries so far...", count);
+                            println!("📦 Migrated {} kvs so far...", count);
                         }
                         Err(e) => {
                             println!("❌ Failed to write batch: {}", e);
@@ -449,24 +482,24 @@ fn migrate_column_family_full(
     // Write remaining entries in the batch
     if batch_size > 0 {
         match target_db.write(write_batch) {
-            Ok(_) => println!("📦 Wrote final batch of {} entries", batch_size),
+            Ok(_) => println!("📦 Wrote final batch of {} kvs", batch_size),
             Err(e) => return Err(anyhow!("Failed to write final batch: {}", e)),
         }
     }
-    
+
     // Verify migration by comparing counts
     println!("🔍 Verifying migration...");
-    let source_count = count_entries(source_db, source_cf)?;
-    let final_target_count = count_entries(target_db, target_cf)?;
+    let source_count = count_kvs(source_db, source_cf)?;
+    let final_target_count = count_kvs(target_db, target_cf)?;
     let migrated_count = final_target_count - initial_target_count;
-    
+
     if source_count == migrated_count {
-        println!("✅ Migration verification successful: {} entries migrated", migrated_count);
+        println!("✅ Migration verification successful: {} kvs migrated", migrated_count);
         println!("📊 Summary:");
-        println!("   - Source entries: {}", source_count);
-        println!("   - Target entries (before): {}", initial_target_count);
-        println!("   - Target entries (after): {}", final_target_count);
-        println!("   - Migrated entries: {}", migrated_count);
+        println!("   - Source kvs: {}", source_count);
+        println!("   - Target kvs (before): {}", initial_target_count);
+        println!("   - Target kvs (after): {}", final_target_count);
+        println!("   - Migrated kvs: {}", migrated_count);
     } else {
         return Err(anyhow!(
             "Migration verification failed: source={}, migrated={}, target_total={}",
@@ -651,7 +684,7 @@ fn migrate_muts_rev_selective(source_db: &DB, target_db: &DB, temporal_entry_has
             if count % batch_size == 0 {
                 let batch_to_write = std::mem::replace(&mut write_batch, rocksdb::WriteBatch::default());
                 target_db.write(batch_to_write)?;
-                println!("📦 Migrated {} muts_rev entries...", count);
+                println!("📦 Migrated {} muts_rev kvs...", count);
             }
         } else {
             not_found += 1;
@@ -663,7 +696,7 @@ fn migrate_muts_rev_selective(source_db: &DB, target_db: &DB, temporal_entry_has
         target_db.write(write_batch)?;
     }
 
-    println!("✅ muts_rev migration complete: {} entries migrated, {} not found in source", count, not_found);
+    println!("✅ muts_rev migration complete: {} kvs migrated, {} not found in source", count, not_found);
     if not_found > 0 {
         println!("ℹ️  {} temporal entries did not have corresponding muts_rev data (this may be normal)", not_found);
     }
@@ -798,7 +831,7 @@ fn get_prev_height_from_entry(entry_data: &[u8], source_db: &DB) -> Result<Optio
 }
 
 
-fn count_entries(db: &DB, cf: &impl rocksdb::AsColumnFamilyRef) -> Result<usize> {
+fn count_kvs(db: &DB, cf: &impl rocksdb::AsColumnFamilyRef) -> Result<usize> {
     let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
     let mut count = 0;
     for item in iter {
