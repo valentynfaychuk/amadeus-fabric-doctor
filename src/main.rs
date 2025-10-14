@@ -42,6 +42,10 @@ struct Cli {
     /// Test entry hash verification and output results to JSON file
     #[arg(long, value_name = "OUTPUT_FILE")]
     test: Option<String>,
+
+    /// Show temporal and rooted tips from sysconf
+    #[arg(long)]
+    tips: bool,
 }
 
 fn main() -> Result<()> {
@@ -59,7 +63,9 @@ fn main() -> Result<()> {
             .cf_handle("contractstate")
             .ok_or_else(|| anyhow!("contractstate column family not found"))?;
 
-        if cli.list_keys {
+        if cli.tips {
+            show_tips(&db)?;
+        } else if cli.list_keys {
             list_keys(&db, &contractstate_cf)?;
         } else if let Some(key_hex) = cli.key {
             get_value(&db, &contractstate_cf, &key_hex, cli.raw)?;
@@ -839,6 +845,56 @@ fn count_kvs(db: &DB, cf: &impl rocksdb::AsColumnFamilyRef) -> Result<usize> {
         count += 1;
     }
     Ok(count)
+}
+
+fn show_tips(db: &DB) -> Result<()> {
+    println!("📊 Blockchain Tips from sysconf");
+    println!("{}", "=".repeat(80));
+
+    let sysconf_cf = db
+        .cf_handle("sysconf")
+        .ok_or_else(|| anyhow!("sysconf column family not found"))?;
+
+    // Get temporal_height
+    if let Some(value) = db.get_cf(&sysconf_cf, "temporal_height".as_bytes())? {
+        if let Ok(term) = Term::decode(&value[..]) {
+            let height = match term {
+                Term::BigInteger(big_int) => big_int.value.clone().try_into().unwrap_or(0),
+                Term::FixInteger(fix_int) => fix_int.value as u64,
+                _ => 0,
+            };
+            println!("Temporal Height: {}", height);
+        }
+    } else {
+        println!("Temporal Height: (not found)");
+    }
+
+    // Check for temporal_tip (might not exist)
+    if let Some(value) = db.get_cf(&sysconf_cf, "temporal_tip".as_bytes())? {
+        println!("Temporal Tip:    {}", hex::encode(&value));
+    }
+
+    // Get rooted_tip
+    if let Some(rooted_tip_hash) = db.get_cf(&sysconf_cf, "rooted_tip".as_bytes())? {
+        println!("Rooted Tip:      {}", hex::encode(&rooted_tip_hash));
+
+        // Try to get the height of the rooted tip
+        let default_cf = db
+            .cf_handle("default")
+            .ok_or_else(|| anyhow!("default CF not found"))?;
+
+        if let Some(entry_data) = db.get_cf(&default_cf, &rooted_tip_hash)? {
+            if let Ok((height, slot, _hash)) = parse_entry_metadata(&entry_data) {
+                println!("Rooted Height:   {}", height);
+                println!("Rooted Slot:     {}", slot);
+            }
+        }
+    } else {
+        println!("Rooted Tip:      (not found)");
+    }
+
+    println!("{}", "=".repeat(80));
+    Ok(())
 }
 
 fn list_keys(db: &DB, cf_handle: &impl rocksdb::AsColumnFamilyRef) -> Result<()> {

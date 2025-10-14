@@ -9,6 +9,13 @@ cargo build --release
 ./target/release/amadeus-fabric-doctor --help
 ```
 
+## Where do I get a source database?
+
+The rocksdb database is snapshotted regularly and available at:
+```bash
+wget https://snapshots.amadeus.bot/000034076355.zip
+```
+
 ## What Can I Do?
 
 ### List Keys in ContractState
