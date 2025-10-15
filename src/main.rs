@@ -261,19 +261,20 @@ fn create_target_database(db_path: &str) -> Result<()> {
     // Limit open files to prevent "Too many open files" error
     opts.set_max_open_files(1000);
     
-    // Define all the column families that exist in the Amadeus fabric database
+    // Define all the column families that exist in the Amadeus fabric database (new format)
     let cf_names = vec![
         "default",
-        "entry_by_height|height:entryhash",
-        "entry_by_slot|slot:entryhash",
-        "tx|txhash:entryhash",
+        "entry",
+        "entry_by_height|height->entryhash",
+        "entry_by_slot|slot->entryhash",
+        "my_seen_time_entry|entryhash->ts_sec",
+        "my_attestation_for_entry|entryhash->attestation",
+        "tx|txhash->entryhash",
         "tx_account_nonce|account:nonce->txhash",
         "tx_receiver_nonce|receiver:nonce->txhash",
-        "my_seen_time_entry|entryhash",
-        "my_attestation_for_entry|entryhash",
         "consensus",
         "consensus_by_entryhash|Map<mutationshash,consensus>",
-        "contractstate", // This is the one we're migrating
+        "contractstate",
         "muts",
         "muts_rev",
         "sysconf",
@@ -536,13 +537,16 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
         .or_else(|| source_db.cf_handle("default"))
         .ok_or_else(|| anyhow!("entry/default CF not found in source"))?;
     let target_default_cf = target_db
-        .cf_handle("default")
-        .ok_or_else(|| anyhow!("default CF not found in target"))?;
+        .cf_handle("entry")
+        .or_else(|| target_db.cf_handle("default"))
+        .ok_or_else(|| anyhow!("entry/default CF not found in target"))?;
     let target_entry_by_height_cf = target_db
-        .cf_handle("entry_by_height|height:entryhash")
+        .cf_handle("entry_by_height|height->entryhash")
+        .or_else(|| target_db.cf_handle("entry_by_height|height:entryhash"))
         .ok_or_else(|| anyhow!("entry_by_height CF not found in target"))?;
     let target_entry_by_slot_cf = target_db
-        .cf_handle("entry_by_slot|slot:entryhash")
+        .cf_handle("entry_by_slot|slot->entryhash")
+        .or_else(|| target_db.cf_handle("entry_by_slot|slot:entryhash"))
         .ok_or_else(|| anyhow!("entry_by_slot CF not found in target"))?;
 
     let mut migrated_entries = 0;
@@ -795,7 +799,8 @@ fn migrate_my_attestations_selective(source_db: &DB, target_db: &DB, temporal_en
         .or_else(|| source_db.cf_handle("my_attestation_for_entry|entryhash"))
         .ok_or_else(|| anyhow!("my_attestation_for_entry CF not found in source"))?;
     let target_cf = target_db
-        .cf_handle("my_attestation_for_entry|entryhash")
+        .cf_handle("my_attestation_for_entry|entryhash->attestation")
+        .or_else(|| target_db.cf_handle("my_attestation_for_entry|entryhash"))
         .ok_or_else(|| anyhow!("my_attestation_for_entry CF not found in target"))?;
 
     let mut count = 0;
