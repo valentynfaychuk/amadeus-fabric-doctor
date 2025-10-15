@@ -339,10 +339,11 @@ fn extract_heights(source_db: &DB) -> Result<(u64, u64)> {
     if let Some(rooted_tip_hash) = source_db.get_cf(&sysconf_cf, "rooted_tip".as_bytes())? {
         println!("  Found rooted_tip hash: {} bytes", rooted_tip_hash.len());
 
-        // Look up the entry by this hash in the default CF
+        // Look up the entry by this hash (try "entry" CF first, then "default")
         let default_cf = source_db
-            .cf_handle("default")
-            .ok_or_else(|| anyhow!("default CF not found"))?;
+            .cf_handle("entry")
+            .or_else(|| source_db.cf_handle("default"))
+            .ok_or_else(|| anyhow!("entry/default CF not found"))?;
 
         if let Some(entry_data) = source_db.get_cf(&default_cf, &rooted_tip_hash)? {
             println!("  Found rooted entry: {} bytes", entry_data.len());
@@ -525,9 +526,11 @@ fn migrate_column_family_full(
 fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u64, rooted_height: u64) -> Result<Vec<Vec<u8>>> {
     println!("🔄 Migrating default CF (selective: temporal to rooted + chain to genesis)...");
 
+    // New Elixir format uses separate "entry" CF, old format uses "default"
     let source_default_cf = source_db
-        .cf_handle("default")
-        .ok_or_else(|| anyhow!("default CF not found in source"))?;
+        .cf_handle("entry")
+        .or_else(|| source_db.cf_handle("default"))
+        .ok_or_else(|| anyhow!("entry/default CF not found in source"))?;
     let target_default_cf = target_db
         .cf_handle("default")
         .ok_or_else(|| anyhow!("default CF not found in target"))?;
@@ -971,9 +974,10 @@ fn get_prev_height_from_entry(entry_data: &[u8], source_db: &DB) -> Result<Optio
                                     return Ok(Some(0));
                                 }
 
-                                // Look up previous entry by hash to get its height
-                                let default_cf = source_db.cf_handle("default")
-                                    .ok_or_else(|| anyhow!("default CF not found"))?;
+                                // Look up previous entry by hash to get its height (try "entry" first, then "default")
+                                let default_cf = source_db.cf_handle("entry")
+                                    .or_else(|| source_db.cf_handle("default"))
+                                    .ok_or_else(|| anyhow!("entry/default CF not found"))?;
 
                                 if let Some(prev_entry_data) = source_db.get_cf(&default_cf, &prev_hash)? {
                                     if let Ok((prev_height, _slot, _hash)) = parse_entry_metadata(&prev_entry_data) {
