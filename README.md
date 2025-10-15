@@ -38,9 +38,9 @@ wget https://snapshots.amadeus.bot/000034076355.zip
 **Run**: `./amadeus-fabric-doctor --db-path /source/db --migrate /target/db`
 **Result**: Migrates:
 - **contractstate**: Full (all 11k+ kvs)
-- **sysconf**: Full (3 kvs with system state)
+- **sysconf**: Full + adds rooted_height
 - **default**: Smart filtered (temporal→rooted entries + chain to genesis)
-- **muts_rev**: Filtered (only temporal entries)
+- **muts_rev, muts, my_attestations, consensus**: Filtered (only temporal entries)
 
 ### Migrate Only State (Quick)
 **Want to**: Just migrate contractstate + sysconf (fastest migration)
@@ -76,10 +76,10 @@ wget https://snapshots.amadeus.bot/000034076355.zip
 | Feature | --weakmigrate (Fast) | --migrate (Complete) |
 |---------|---------------------|----------------------|
 | contractstate | ✅ Full | ✅ Full |
-| sysconf | ✅ Full | ✅ Full |
+| sysconf | ✅ Full | ✅ Full + rooted_height |
 | Blockchain entries | ❌ Skipped | ✅ Filtered by height |
 | Entry indexes | ❌ Skipped | ✅ Filtered by height |
-| muts_rev | ❌ Skipped | ✅ Temporal entries only |
+| muts_rev, muts, my_attestations, consensus | ❌ Skipped | ✅ Temporal entries only |
 | **Speed** | **Fast** | Slower (more data) |
 | **Use for** | **State-only needs** | Full node operation |
 

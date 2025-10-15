@@ -194,14 +194,18 @@ fn perform_migration(source_db_path: &str, target_db_path: &str) -> Result<()> {
     // Step 2: Migrate contractstate (full)
     migrate_contractstate_full(&source_db, &target_db)?;
 
-    // Step 3: Migrate sysconf (full)
+    // Step 3: Migrate sysconf (full) + add rooted_height
     migrate_sysconf_full(&source_db, &target_db)?;
+    write_rooted_height_to_sysconf(&target_db, rooted_height)?;
 
     // Step 4: Migrate default CF (selective: temporal to rooted + chain to genesis)
     let migrated_entry_hashes = migrate_default_selective(&source_db, &target_db, temporal_height, rooted_height)?;
 
-    // Step 5: Migrate muts_rev (temporal entries only) using collected temporal entry hashes
+    // Step 5: Migrate muts_rev, muts, my_attestations, consensus (temporal entries only)
     migrate_muts_rev_selective(&source_db, &target_db, &migrated_entry_hashes)?;
+    migrate_muts_selective(&source_db, &target_db, &migrated_entry_hashes)?;
+    migrate_my_attestations_selective(&source_db, &target_db, &migrated_entry_hashes)?;
+    migrate_consensus_selective(&source_db, &target_db, &migrated_entry_hashes)?;
 
     println!("✅ Comprehensive migration completed successfully!");
     Ok(())
@@ -706,6 +710,154 @@ fn migrate_muts_rev_selective(source_db: &DB, target_db: &DB, temporal_entry_has
     if not_found > 0 {
         println!("ℹ️  {} temporal entries did not have corresponding muts_rev data (this may be normal)", not_found);
     }
+    Ok(())
+}
+
+fn write_rooted_height_to_sysconf(target_db: &DB, rooted_height: u64) -> Result<()> {
+    println!("🔄 Writing rooted_height to sysconf...");
+
+    let target_cf = target_db
+        .cf_handle("sysconf")
+        .ok_or_else(|| anyhow!("sysconf CF not found in target"))?;
+
+    // Encode rooted_height as ETF (matching temporal_height format)
+    // For blockchain heights, FixInteger (i32) should suffice for reasonable heights
+    let mut encoded_height = Vec::new();
+    if rooted_height <= i32::MAX as u64 {
+        Term::FixInteger(eetf::FixInteger { value: rooted_height as i32 }).encode(&mut encoded_height)?;
+    } else {
+        // For very large heights, encode as a binary string (will be parsed back as integer)
+        let height_str = rooted_height.to_string();
+        Term::Binary(eetf::Binary { bytes: height_str.into_bytes() }).encode(&mut encoded_height)?;
+    }
+
+    target_db.put_cf(&target_cf, "rooted_height".as_bytes(), &encoded_height)?;
+    println!("✅ rooted_height ({}) written to sysconf", rooted_height);
+    Ok(())
+}
+
+fn migrate_muts_selective(source_db: &DB, target_db: &DB, temporal_entry_hashes: &[Vec<u8>]) -> Result<()> {
+    println!("🔄 Migrating muts (for temporal entries only)...");
+
+    let source_cf = source_db
+        .cf_handle("muts")
+        .ok_or_else(|| anyhow!("muts CF not found in source"))?;
+    let target_cf = target_db
+        .cf_handle("muts")
+        .ok_or_else(|| anyhow!("muts CF not found in target"))?;
+
+    let mut count = 0;
+    let mut write_batch = rocksdb::WriteBatch::default();
+    let batch_size = 1000;
+    let mut not_found = 0;
+
+    for entry_hash in temporal_entry_hashes {
+        if let Some(value) = source_db.get_cf(&source_cf, entry_hash)? {
+            write_batch.put_cf(&target_cf, entry_hash, &value);
+            count += 1;
+
+            if count % batch_size == 0 {
+                let batch_to_write = std::mem::replace(&mut write_batch, rocksdb::WriteBatch::default());
+                target_db.write(batch_to_write)?;
+                println!("📦 Migrated {} muts kvs...", count);
+            }
+        } else {
+            not_found += 1;
+        }
+    }
+
+    if !write_batch.is_empty() {
+        target_db.write(write_batch)?;
+    }
+
+    println!("✅ muts migration complete: {} kvs migrated, {} not found", count, not_found);
+    Ok(())
+}
+
+fn migrate_my_attestations_selective(source_db: &DB, target_db: &DB, temporal_entry_hashes: &[Vec<u8>]) -> Result<()> {
+    println!("🔄 Migrating my_attestation_for_entry (for temporal entries only)...");
+
+    let source_cf = source_db
+        .cf_handle("my_attestation_for_entry|entryhash")
+        .ok_or_else(|| anyhow!("my_attestation_for_entry CF not found in source"))?;
+    let target_cf = target_db
+        .cf_handle("my_attestation_for_entry|entryhash")
+        .ok_or_else(|| anyhow!("my_attestation_for_entry CF not found in target"))?;
+
+    let mut count = 0;
+    let mut write_batch = rocksdb::WriteBatch::default();
+    let batch_size = 1000;
+    let mut not_found = 0;
+
+    for entry_hash in temporal_entry_hashes {
+        if let Some(value) = source_db.get_cf(&source_cf, entry_hash)? {
+            write_batch.put_cf(&target_cf, entry_hash, &value);
+            count += 1;
+
+            if count % batch_size == 0 {
+                let batch_to_write = std::mem::replace(&mut write_batch, rocksdb::WriteBatch::default());
+                target_db.write(batch_to_write)?;
+                println!("📦 Migrated {} my_attestations kvs...", count);
+            }
+        } else {
+            not_found += 1;
+        }
+    }
+
+    if !write_batch.is_empty() {
+        target_db.write(write_batch)?;
+    }
+
+    println!("✅ my_attestations migration complete: {} kvs migrated, {} not found", count, not_found);
+    Ok(())
+}
+
+fn migrate_consensus_selective(source_db: &DB, target_db: &DB, temporal_entry_hashes: &[Vec<u8>]) -> Result<()> {
+    println!("🔄 Migrating consensus (for temporal entries only)...");
+
+    let source_consensus_cf = source_db
+        .cf_handle("consensus")
+        .ok_or_else(|| anyhow!("consensus CF not found in source"))?;
+    let target_consensus_cf = target_db
+        .cf_handle("consensus")
+        .ok_or_else(|| anyhow!("consensus CF not found in target"))?;
+    let source_consensus_by_entryhash_cf = source_db
+        .cf_handle("consensus_by_entryhash|Map<mutationshash,consensus>")
+        .ok_or_else(|| anyhow!("consensus_by_entryhash CF not found in source"))?;
+    let target_consensus_by_entryhash_cf = target_db
+        .cf_handle("consensus_by_entryhash|Map<mutationshash,consensus>")
+        .ok_or_else(|| anyhow!("consensus_by_entryhash CF not found in target"))?;
+
+    let mut count_consensus = 0;
+    let mut count_by_entryhash = 0;
+    let mut write_batch = rocksdb::WriteBatch::default();
+    let batch_size = 1000;
+
+    for entry_hash in temporal_entry_hashes {
+        // Migrate from consensus CF
+        if let Some(value) = source_db.get_cf(&source_consensus_cf, entry_hash)? {
+            write_batch.put_cf(&target_consensus_cf, entry_hash, &value);
+            count_consensus += 1;
+        }
+
+        // Migrate from consensus_by_entryhash CF
+        if let Some(value) = source_db.get_cf(&source_consensus_by_entryhash_cf, entry_hash)? {
+            write_batch.put_cf(&target_consensus_by_entryhash_cf, entry_hash, &value);
+            count_by_entryhash += 1;
+        }
+
+        if (count_consensus + count_by_entryhash) % batch_size == 0 {
+            let batch_to_write = std::mem::replace(&mut write_batch, rocksdb::WriteBatch::default());
+            target_db.write(batch_to_write)?;
+            println!("📦 Migrated {} consensus kvs...", count_consensus + count_by_entryhash);
+        }
+    }
+
+    if !write_batch.is_empty() {
+        target_db.write(write_batch)?;
+    }
+
+    println!("✅ consensus migration complete: {} consensus, {} by_entryhash migrated", count_consensus, count_by_entryhash);
     Ok(())
 }
 
