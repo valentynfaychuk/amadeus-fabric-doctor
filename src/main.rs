@@ -608,12 +608,17 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
     }
 
     // Phase 2: Migrate chain from rooted_height down to genesis (follow prev_hash chain)
-    println!("📦 Phase 2: Migrating chain from rooted height {} down to genesis", rooted_height);
+    println!("📦 Phase 2: Migrating chain from rooted height {} down to genesis (max 1000 entries)", rooted_height);
 
     let mut current_height = rooted_height;
     let mut chain_entries = 0;
+    let max_chain_entries = 1000;
 
     loop {
+        if chain_entries >= max_chain_entries {
+            println!("📍 Reached limit of {} chain entries", max_chain_entries);
+            break;
+        }
         // Find entry at current_height using index (much faster!)
         if let Some(entry_at_height) = find_entry_at_height_indexed(source_db, &source_entry_by_height_cf, &source_default_cf, current_height)? {
             let (key, value) = entry_at_height;
