@@ -547,9 +547,10 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
     // Phase 1: Migrate entries between temporal_height and rooted_height
     println!("📦 Phase 1: Migrating entries from temporal height {} to rooted height {}", temporal_height, rooted_height);
 
-    // Get source entry_by_height index for efficient lookup
+    // Get source entry_by_height index for efficient lookup (try both naming formats)
     let source_entry_by_height_cf = source_db
-        .cf_handle("entry_by_height|height:entryhash")
+        .cf_handle("entry_by_height|height->entryhash")
+        .or_else(|| source_db.cf_handle("entry_by_height|height:entryhash"))
         .ok_or_else(|| anyhow!("entry_by_height CF not found in source"))?;
 
     // Use index-based lookup instead of full table scan
@@ -778,7 +779,8 @@ fn migrate_my_attestations_selective(source_db: &DB, target_db: &DB, temporal_en
     println!("🔄 Migrating my_attestation_for_entry (for temporal entries only)...");
 
     let source_cf = source_db
-        .cf_handle("my_attestation_for_entry|entryhash")
+        .cf_handle("my_attestation_for_entry|entryhash->attestation")
+        .or_else(|| source_db.cf_handle("my_attestation_for_entry|entryhash"))
         .ok_or_else(|| anyhow!("my_attestation_for_entry CF not found in source"))?;
     let target_cf = target_db
         .cf_handle("my_attestation_for_entry|entryhash")
