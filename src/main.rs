@@ -133,6 +133,8 @@ fn open_target_database_readwrite(db_path: &str) -> Result<DB> {
 
     let mut opts = Options::default();
     opts.create_if_missing(false);
+    // Limit open files to prevent "Too many open files" error during large migrations
+    opts.set_max_open_files(1000);
 
     // Try to discover existing column families
     let cf_names = match DB::list_cf(&opts, db_path) {
@@ -166,7 +168,7 @@ fn open_target_database_readwrite(db_path: &str) -> Result<DB> {
         .collect();
 
     let db = DB::open_cf_descriptors(&opts, db_path, cf_descriptors)?;
-    println!("📝 Target database opened in READ-WRITE mode");
+    println!("📝 Target database opened in READ-WRITE mode (max_open_files=1000)");
     Ok(db)
 }
 
@@ -240,22 +242,24 @@ fn perform_weak_migration(source_db_path: &str, target_db_path: &str) -> Result<
 
 fn create_target_database(db_path: &str) -> Result<()> {
     let path = Path::new(db_path);
-    
+
     if path.exists() {
         println!("ℹ️  Target database already exists at: {}", db_path);
         return Ok(());
     }
-    
+
     println!("🏗️  Creating new database at: {}", db_path);
-    
+
     // Create parent directories if they don't exist
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    
+
     let mut opts = Options::default();
     opts.create_if_missing(true);
     opts.create_missing_column_families(true);
+    // Limit open files to prevent "Too many open files" error
+    opts.set_max_open_files(1000);
     
     // Define all the column families that exist in the Amadeus fabric database
     let cf_names = vec![
