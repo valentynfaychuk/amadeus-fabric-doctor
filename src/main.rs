@@ -611,6 +611,73 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
 
     }
 
+    // Phase 3: Migrate entries above temporal_height (going upwards until no entries found)
+    println!("📦 Phase 3: Migrating entries above temporal height {} (going upwards)", temporal_height);
+
+    let mut current_height = temporal_height + 1;
+    let mut above_temporal_entries = 0;
+    let mut consecutive_empty_heights = 0;
+    let max_consecutive_empty = 5; // Stop after 5 consecutive empty heights
+
+    loop {
+        let height_prefix = format!("{}:", current_height);
+        let mut found_entries_at_height = false;
+
+        let iter = source_db.iterator_cf(&source_entry_by_height_cf, rocksdb::IteratorMode::From(height_prefix.as_bytes(), rocksdb::Direction::Forward));
+        for item in iter {
+            let (index_key, entry_hash) = item?;
+
+            // Check if we're still in the right height range
+            let height_prefix_bytes = height_prefix.as_bytes();
+            if !index_key.starts_with(height_prefix_bytes) {
+                break; // Moved past this height
+            }
+
+            // Get the actual entry from default CF
+            if let Some(entry_data) = source_db.get_cf(&source_default_cf, &entry_hash)? {
+                // Parse entry to get slot
+                if let Ok((_height, slot, computed_hash)) = parse_entry_metadata(&entry_data) {
+                    // Add to default CF
+                    write_batch.put_cf(&target_default_cf, &entry_hash, &entry_data);
+
+                    // Add to entry_by_height index
+                    let height_key = format!("{}:{}", current_height, hex::encode(&computed_hash));
+                    write_batch.put_cf(&target_entry_by_height_cf, height_key.as_bytes(), &computed_hash);
+
+                    // Add to entry_by_slot index
+                    let slot_key = format!("{}:{}", slot, hex::encode(&computed_hash));
+                    write_batch.put_cf(&target_entry_by_slot_cf, slot_key.as_bytes(), &computed_hash);
+
+                    // Collect entry hash for muts_rev migration (entries above temporal are also temporal-like)
+                    temporal_entry_hashes.push(entry_hash.to_vec());
+
+                    above_temporal_entries += 1;
+                    found_entries_at_height = true;
+
+                    if above_temporal_entries % batch_size == 0 {
+                        let batch_to_write = std::mem::replace(&mut write_batch, rocksdb::WriteBatch::default());
+                        target_db.write(batch_to_write)?;
+                        println!("📦 Migrated {} entries above temporal (Phase 3)...", above_temporal_entries);
+                    }
+                }
+            }
+        }
+
+        if found_entries_at_height {
+            consecutive_empty_heights = 0;
+            current_height += 1;
+        } else {
+            consecutive_empty_heights += 1;
+            if consecutive_empty_heights >= max_consecutive_empty {
+                println!("📍 No entries found for {} consecutive heights, stopping at height {}", max_consecutive_empty, current_height);
+                break;
+            }
+            current_height += 1;
+        }
+    }
+
+    println!("✅ Phase 3 complete: {} entries above temporal height migrated", above_temporal_entries);
+
     // Phase 2: Migrate chain from rooted_height down to genesis (follow prev_hash chain)
     println!("📦 Phase 2: Migrating chain from rooted height {} down to genesis (max 1000 entries)", rooted_height);
 
@@ -680,8 +747,11 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
         target_db.write(write_batch)?;
     }
 
-    println!("✅ Default CF migration complete: {} temporal-rooted entries, {} chain entries",
-             migrated_entries, chain_entries);
+    println!("✅ Default CF migration complete:");
+    println!("   - Phase 1 (temporal-rooted): {} entries", migrated_entries);
+    println!("   - Phase 3 (above temporal): {} entries", above_temporal_entries);
+    println!("   - Phase 2 (chain to genesis): {} entries", chain_entries);
+    println!("   - Total entries migrated: {}", migrated_entries + above_temporal_entries + chain_entries);
     println!("📊 Collected {} temporal entry hashes for muts_rev migration", temporal_entry_hashes.len());
     println!("📊 Collected {} rooted entry hashes (for reference)", rooted_entry_hashes.len());
     Ok(temporal_entry_hashes)
