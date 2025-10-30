@@ -587,13 +587,15 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
                     // Add to default CF
                     write_batch.put_cf(&target_default_cf, &entry_hash, &entry_data);
 
-                    // Add to entry_by_height index (format: "height:hash")
-                    let height_key = format!("{}:{}", height, hex::encode(&computed_hash));
-                    write_batch.put_cf(&target_entry_by_height_cf, height_key.as_bytes(), &computed_hash);
+                    // Add to entry_by_height index (format: "height:binary_hash" - Elixir expects binary, not hex)
+                    let mut height_key = format!("{}:", height).into_bytes();
+                    height_key.extend_from_slice(&computed_hash);
+                    write_batch.put_cf(&target_entry_by_height_cf, &height_key, &computed_hash);
 
-                    // Add to entry_by_slot index (format: "slot:hash")
-                    let slot_key = format!("{}:{}", slot, hex::encode(&computed_hash));
-                    write_batch.put_cf(&target_entry_by_slot_cf, slot_key.as_bytes(), &computed_hash);
+                    // Add to entry_by_slot index (format: "slot:binary_hash" - Elixir expects binary, not hex)
+                    let mut slot_key = format!("{}:", slot).into_bytes();
+                    slot_key.extend_from_slice(&computed_hash);
+                    write_batch.put_cf(&target_entry_by_slot_cf, &slot_key, &computed_hash);
 
                     // Collect temporal entry hash for muts_rev migration
                     temporal_entry_hashes.push(entry_hash.to_vec());
@@ -640,13 +642,15 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
                     // Add to default CF
                     write_batch.put_cf(&target_default_cf, &entry_hash, &entry_data);
 
-                    // Add to entry_by_height index
-                    let height_key = format!("{}:{}", current_height, hex::encode(&computed_hash));
-                    write_batch.put_cf(&target_entry_by_height_cf, height_key.as_bytes(), &computed_hash);
+                    // Add to entry_by_height index (format: "height:binary_hash")
+                    let mut height_key = format!("{}:", current_height).into_bytes();
+                    height_key.extend_from_slice(&computed_hash);
+                    write_batch.put_cf(&target_entry_by_height_cf, &height_key, &computed_hash);
 
-                    // Add to entry_by_slot index
-                    let slot_key = format!("{}:{}", slot, hex::encode(&computed_hash));
-                    write_batch.put_cf(&target_entry_by_slot_cf, slot_key.as_bytes(), &computed_hash);
+                    // Add to entry_by_slot index (format: "slot:binary_hash")
+                    let mut slot_key = format!("{}:", slot).into_bytes();
+                    slot_key.extend_from_slice(&computed_hash);
+                    write_batch.put_cf(&target_entry_by_slot_cf, &slot_key, &computed_hash);
 
                     // Collect entry hash for muts_rev migration (entries above temporal are also temporal-like)
                     temporal_entry_hashes.push(entry_hash.to_vec());
@@ -699,12 +703,14 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
                 // Add to default CF
                 write_batch.put_cf(&target_default_cf, &key, &value);
 
-                // Add to indexes (format: "height:hash" and "slot:hash")
-                let height_key = format!("{}:{}", height, hex::encode(&entry_hash));
-                write_batch.put_cf(&target_entry_by_height_cf, height_key.as_bytes(), &entry_hash);
+                // Add to indexes (format: "height:binary_hash" and "slot:binary_hash")
+                let mut height_key = format!("{}:", height).into_bytes();
+                height_key.extend_from_slice(&entry_hash);
+                write_batch.put_cf(&target_entry_by_height_cf, &height_key, &entry_hash);
 
-                let slot_key = format!("{}:{}", slot, hex::encode(&entry_hash));
-                write_batch.put_cf(&target_entry_by_slot_cf, slot_key.as_bytes(), &entry_hash);
+                let mut slot_key = format!("{}:", slot).into_bytes();
+                slot_key.extend_from_slice(&entry_hash);
+                write_batch.put_cf(&target_entry_by_slot_cf, &slot_key, &entry_hash);
 
                 // Collect rooted entry hash (for reference, not muts_rev)
                 rooted_entry_hashes.push(key.to_vec());
