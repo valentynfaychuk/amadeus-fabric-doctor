@@ -320,78 +320,68 @@ fn extract_heights(source_db: &DB) -> Result<(u64, u64)> {
     let mut temporal_height = 0u64;
     let mut rooted_height = 0u64;
 
-    println!("🔍 Looking for temporal_height...");
-    if let Some(value) = source_db.get_cf(&sysconf_cf, "temporal_height".as_bytes())? {
-        println!("  Found temporal_height key: {} bytes", value.len());
-        if let Ok(term) = Term::decode(&value[..]) {
-            if let Term::BigInteger(big_int) = term {
-                temporal_height = big_int.value.clone().try_into().unwrap_or(0);
-                println!("  Parsed temporal_height: {}", temporal_height);
-            } else if let Term::FixInteger(fix_int) = term {
-                temporal_height = fix_int.value as u64;
-                println!("  Parsed temporal_height: {}", temporal_height);
+    let entry_meta_cf = source_db
+        .cf_handle("entry_meta")
+        .ok_or_else(|| anyhow!("entry_meta CF not found"))?;
+
+    // Get temporal_tip and derive height from entry_meta
+    println!("🔍 Looking for temporal_tip...");
+    let temporal_tip_hash = source_db
+        .get_cf(&sysconf_cf, "temporal_tip".as_bytes())?
+        .ok_or_else(|| anyhow!("temporal_tip not found in sysconf"))?;
+    println!("  Found temporal_tip hash: {}", hex::encode(&temporal_tip_hash));
+
+    // Find height from entry_meta by scanning for the hash
+    let prefix = "by_height:";
+    let iter = source_db.iterator_cf(&entry_meta_cf, rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward));
+
+    for item in iter {
+        if let Ok((key, hash_value)) = item {
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            if &*hash_value == temporal_tip_hash.as_slice() {
+                if let Ok(key_str) = std::str::from_utf8(&key) {
+                    if let Some(height_str) = key_str.strip_prefix("by_height:") {
+                        if let Some(height_part) = height_str.split(':').next() {
+                            if let Ok(h) = height_part.parse::<u64>() {
+                                temporal_height = h;
+                                println!("  temporal_height from entry_meta: {}", temporal_height);
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
     if temporal_height == 0 {
-        println!("  temporal_height key not found, trying temporal_tip...");
-        if let Some(temporal_tip_hash) = source_db.get_cf(&sysconf_cf, "temporal_tip".as_bytes())? {
-            println!("  Found temporal_tip hash: {} bytes", temporal_tip_hash.len());
-
-            // Try to find height from entry_meta CF by scanning for the hash
-            if let Some(entry_meta_cf) = source_db.cf_handle("entry_meta") {
-                let prefix = "by_height:";
-                let iter = source_db.iterator_cf(&entry_meta_cf, rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward));
-
-                for item in iter {
-                    if let Ok((key, hash_value)) = item {
-                        if !key.starts_with(prefix.as_bytes()) {
-                            break;
-                        }
-                        if &*hash_value == temporal_tip_hash.as_slice() {
-                            if let Ok(key_str) = std::str::from_utf8(&key) {
-                                if let Some(height_str) = key_str.strip_prefix("by_height:") {
-                                    if let Some(height_part) = height_str.split(':').next() {
-                                        if let Ok(h) = height_part.parse::<u64>() {
-                                            temporal_height = h;
-                                            println!("  Got temporal_height from entry_meta: {}", temporal_height);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        return Err(anyhow!("Could not find temporal_tip in entry_meta"));
     }
 
+    // Get rooted_tip and derive height from entry_meta
     println!("🔍 Looking for rooted_tip...");
-    if let Some(rooted_tip_hash) = source_db.get_cf(&sysconf_cf, "rooted_tip".as_bytes())? {
-        println!("  Found rooted_tip hash: {} bytes", rooted_tip_hash.len());
+    let rooted_tip_hash = source_db
+        .get_cf(&sysconf_cf, "rooted_tip".as_bytes())?
+        .ok_or_else(|| anyhow!("rooted_tip not found in sysconf"))?;
+    println!("  Found rooted_tip hash: {}", hex::encode(&rooted_tip_hash));
 
-        // Try to find height from entry_meta CF by scanning for the hash
-        if let Some(entry_meta_cf) = source_db.cf_handle("entry_meta") {
-            let prefix = "by_height:";
-            let iter = source_db.iterator_cf(&entry_meta_cf, rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward));
+    let iter = source_db.iterator_cf(&entry_meta_cf, rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward));
 
-            for item in iter {
-                if let Ok((key, hash_value)) = item {
-                    if !key.starts_with(prefix.as_bytes()) {
-                        break;
-                    }
-                    if &*hash_value == rooted_tip_hash.as_slice() {
-                        if let Ok(key_str) = std::str::from_utf8(&key) {
-                            if let Some(height_str) = key_str.strip_prefix("by_height:") {
-                                if let Some(height_part) = height_str.split(':').next() {
-                                    if let Ok(h) = height_part.parse::<u64>() {
-                                        rooted_height = h;
-                                        println!("  Got rooted_height from entry_meta: {}", rooted_height);
-                                        break;
-                                    }
-                                }
+    for item in iter {
+        if let Ok((key, hash_value)) = item {
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            if &*hash_value == rooted_tip_hash.as_slice() {
+                if let Ok(key_str) = std::str::from_utf8(&key) {
+                    if let Some(height_str) = key_str.strip_prefix("by_height:") {
+                        if let Some(height_part) = height_str.split(':').next() {
+                            if let Ok(h) = height_part.parse::<u64>() {
+                                rooted_height = h;
+                                println!("  rooted_height from entry_meta: {}", rooted_height);
+                                break;
                             }
                         }
                     }
@@ -400,89 +390,8 @@ fn extract_heights(source_db: &DB) -> Result<(u64, u64)> {
         }
     }
 
-    if temporal_height == 0 && rooted_height == 0 {
-        return Err(anyhow!("Could not find temporal_tip or rooted_tip in sysconf CF"));
-    }
-
-    // Verify temporal_height against temporal_tip (more reliable than temporal_height key)
-    println!("🔍 Verifying temporal_height against temporal_tip...");
-    if let Some(temporal_tip_hash) = source_db.get_cf(&sysconf_cf, "temporal_tip".as_bytes())? {
-        if let Some(entry_meta_cf) = source_db.cf_handle("entry_meta") {
-            let prefix = "by_height:";
-            let iter = source_db.iterator_cf(&entry_meta_cf, rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward));
-
-            for item in iter {
-                if let Ok((key, hash_value)) = item {
-                    if !key.starts_with(prefix.as_bytes()) {
-                        break;
-                    }
-                    if &*hash_value == temporal_tip_hash.as_slice() {
-                        if let Ok(key_str) = std::str::from_utf8(&key) {
-                            if let Some(height_str) = key_str.strip_prefix("by_height:") {
-                                if let Some(height_part) = height_str.split(':').next() {
-                                    if let Ok(h) = height_part.parse::<u64>() {
-                                        println!("  temporal_tip actual height: {}", h);
-                                        println!("  temporal_height from sysconf key: {}", temporal_height);
-
-                                        if h != temporal_height {
-                                            println!("⚠️  Warning: temporal_tip height ({}) differs from temporal_height key ({})", h, temporal_height);
-                                            println!("  Using temporal_tip height as the correct value");
-                                            temporal_height = h;
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Re-verify rooted_height against rooted_tip after temporal_height correction
-    println!("🔍 Re-verifying rooted_height against rooted_tip...");
-    if let Some(rooted_tip_hash) = source_db.get_cf(&sysconf_cf, "rooted_tip".as_bytes())? {
-        if let Some(entry_meta_cf) = source_db.cf_handle("entry_meta") {
-            let prefix = "by_height:";
-            let iter = source_db.iterator_cf(&entry_meta_cf, rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward));
-
-            let mut found = false;
-            for item in iter {
-                if let Ok((key, hash_value)) = item {
-                    if !key.starts_with(prefix.as_bytes()) {
-                        break;
-                    }
-                    if &*hash_value == rooted_tip_hash.as_slice() {
-                        if let Ok(key_str) = std::str::from_utf8(&key) {
-                            if let Some(height_str) = key_str.strip_prefix("by_height:") {
-                                if let Some(height_part) = height_str.split(':').next() {
-                                    if let Ok(h) = height_part.parse::<u64>() {
-                                        println!("  rooted_tip actual height: {}", h);
-                                        println!("  rooted_height previous value: {}", rooted_height);
-                                        if h != rooted_height {
-                                            println!("⚠️  Warning: rooted_tip height ({}) differs from calculated rooted_height ({})", h, rooted_height);
-                                            println!("  Using rooted_tip height as the correct value");
-                                            rooted_height = h;
-                                        }
-                                        found = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if !found && rooted_height == 0 {
-                rooted_height = temporal_height.saturating_sub(10);
-                println!("  Using fallback: temporal_height - 10 = {}", rooted_height);
-            }
-        }
-    } else if rooted_height == 0 {
-        rooted_height = temporal_height.saturating_sub(10);
-        println!("  Using fallback: temporal_height - 10 = {}", rooted_height);
+    if rooted_height == 0 {
+        return Err(anyhow!("Could not find rooted_tip in entry_meta"));
     }
 
     Ok((temporal_height, rooted_height))
