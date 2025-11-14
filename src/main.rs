@@ -404,14 +404,6 @@ fn extract_heights(source_db: &DB) -> Result<(u64, u64)> {
         return Err(anyhow!("Could not find temporal_tip or rooted_tip in sysconf CF"));
     }
 
-    // If only one height is found, use a reasonable default for the other
-    if temporal_height == 0 {
-        temporal_height = rooted_height;
-    }
-    if rooted_height == 0 {
-        rooted_height = temporal_height.saturating_sub(10);
-    }
-
     // Verify temporal_height against temporal_tip (more reliable than temporal_height key)
     println!("🔍 Verifying temporal_height against temporal_tip...");
     if let Some(temporal_tip_hash) = source_db.get_cf(&sysconf_cf, "temporal_tip".as_bytes())? {
@@ -446,6 +438,51 @@ fn extract_heights(source_db: &DB) -> Result<(u64, u64)> {
                 }
             }
         }
+    }
+
+    // Re-verify rooted_height against rooted_tip after temporal_height correction
+    println!("🔍 Re-verifying rooted_height against rooted_tip...");
+    if let Some(rooted_tip_hash) = source_db.get_cf(&sysconf_cf, "rooted_tip".as_bytes())? {
+        if let Some(entry_meta_cf) = source_db.cf_handle("entry_meta") {
+            let prefix = "by_height:";
+            let iter = source_db.iterator_cf(&entry_meta_cf, rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward));
+
+            let mut found = false;
+            for item in iter {
+                if let Ok((key, hash_value)) = item {
+                    if !key.starts_with(prefix.as_bytes()) {
+                        break;
+                    }
+                    if &*hash_value == rooted_tip_hash.as_slice() {
+                        if let Ok(key_str) = std::str::from_utf8(&key) {
+                            if let Some(height_str) = key_str.strip_prefix("by_height:") {
+                                if let Some(height_part) = height_str.split(':').next() {
+                                    if let Ok(h) = height_part.parse::<u64>() {
+                                        println!("  rooted_tip actual height: {}", h);
+                                        println!("  rooted_height previous value: {}", rooted_height);
+                                        if h != rooted_height {
+                                            println!("⚠️  Warning: rooted_tip height ({}) differs from calculated rooted_height ({})", h, rooted_height);
+                                            println!("  Using rooted_tip height as the correct value");
+                                            rooted_height = h;
+                                        }
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !found && rooted_height == 0 {
+                rooted_height = temporal_height.saturating_sub(10);
+                println!("  Using fallback: temporal_height - 10 = {}", rooted_height);
+            }
+        }
+    } else if rooted_height == 0 {
+        rooted_height = temporal_height.saturating_sub(10);
+        println!("  Using fallback: temporal_height - 10 = {}", rooted_height);
     }
 
     Ok((temporal_height, rooted_height))
