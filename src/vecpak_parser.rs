@@ -37,25 +37,38 @@ fn get_prev_hash_from_header(header_term: &Term, source_db: &DB) -> Result<Optio
                 if key_bytes == b"prev_hash" {
                     println!("  [DEBUG] FOUND prev_hash!");
                     if let Term::Binary(prev_hash_bytes) = value {
+                        println!("  [DEBUG] prev_hash is Binary, {} bytes", prev_hash_bytes.len());
                         if prev_hash_bytes.len() == 32 {
                             let prev_hash: [u8; 32] = prev_hash_bytes[..].try_into().unwrap();
 
                             // All-zero hash means genesis
                             if prev_hash == [0u8; 32] {
+                                println!("  [DEBUG] prev_hash is all zeros (genesis)");
                                 return Ok(Some(0));
                             }
 
+                            println!("  [DEBUG] Looking up prev entry by hash: {}", hex::encode(&prev_hash));
                             // Look up previous entry by hash to get its height
                             let entry_cf = source_db.cf_handle("entry")
                                 .ok_or_else(|| anyhow!("entry CF not found"))?;
 
                             if let Some(prev_entry_data) = source_db.get_cf(&entry_cf, &prev_hash)? {
+                                println!("  [DEBUG] Found prev entry, {} bytes", prev_entry_data.len());
                                 // Decode previous entry to get its height
                                 if let Ok(prev_entry_term) = crate::vecpak::decode_term_from_slice(&prev_entry_data) {
+                                    println!("  [DEBUG] Decoded prev entry, getting height");
                                     return get_height_from_entry(&prev_entry_term);
+                                } else {
+                                    println!("  [DEBUG] Failed to decode prev entry");
                                 }
+                            } else {
+                                println!("  [DEBUG] prev entry not found in entry CF");
                             }
+                        } else {
+                            println!("  [DEBUG] prev_hash wrong length: {}", prev_hash_bytes.len());
                         }
+                    } else {
+                        println!("  [DEBUG] prev_hash is not Binary");
                     }
                 }
             }
