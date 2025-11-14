@@ -4,6 +4,8 @@ use rocksdb::{ColumnFamilyDescriptor, DB, Options};
 use serde_json::json;
 use std::path::Path;
 use eetf::Term;
+use amadeus_fabric_doctor::vecpak::decode_term_from_slice;
+use amadeus_fabric_doctor::vecpak_parser::get_prev_height_from_vecpak_entry;
 
 mod utils;
 
@@ -735,16 +737,28 @@ fn migrate_default_selective(source_db: &DB, target_db: &DB, temporal_height: u6
                 println!("📦 Migrated {} chain entries (Phase 2)...", chain_entries);
             }
 
-            // Get prev_hash to continue chain
-            if let Some(prev_height) = get_prev_height_from_entry(&entry_data, source_db)? {
-                if prev_height == 0 {
-                    println!("📍 Reached genesis at height 0");
+            // Try to get prev_height to continue chain (may fail with vecpak entries)
+            match get_prev_height_from_entry(&entry_data, source_db) {
+                Ok(Some(prev_height)) => {
+                    if prev_height == 0 {
+                        println!("📍 Reached genesis at height 0");
+                        break;
+                    }
+                    current_height = prev_height;
+                }
+                Ok(None) => {
+                    println!("⚠️  Could not get prev_height from entry at height {}, stopping chain", current_height);
                     break;
                 }
-                current_height = prev_height;
-            } else {
-                println!("⚠️  Could not get prev_height from entry at height {}, stopping chain", current_height);
-                break;
+                Err(e) => {
+                    if e.to_string().contains("unsupported") || e.to_string().contains("format version") {
+                        println!("⚠️  Entries are vecpak encoded, cannot parse prev_hash. Phase 2 skipped.");
+                        println!("ℹ️  Migrated {} entries at rooted height before encountering parse error", chain_entries);
+                    } else {
+                        println!("⚠️  Failed to parse entry: {}", e);
+                    }
+                    break;
+                }
             }
         } else {
             println!("❌ Missing entry at height {}, gap detected", current_height);
@@ -932,7 +946,14 @@ fn migrate_consensus_selective(source_db: &DB, target_db: &DB, temporal_entry_ha
 // Helper functions for entry parsing and chain following
 
 fn parse_entry_metadata(entry_data: &[u8]) -> Result<(u64, u64, Vec<u8>)> {
-    // Parse ETF entry to extract height, slot, and compute entry hash
+    // Try vecpak decoding first
+    if let Ok(vecpak_term) = decode_term_from_slice(entry_data) {
+        if let Ok((height, slot, hash)) = parse_vecpak_entry_metadata(&vecpak_term) {
+            return Ok((height, slot, hash));
+        }
+    }
+
+    // Fallback to ETF entry parsing
     let term = Term::decode(entry_data)?;
 
     if let Term::Map(map) = term {
@@ -989,6 +1010,55 @@ fn parse_entry_metadata(entry_data: &[u8]) -> Result<(u64, u64, Vec<u8>)> {
     }
 }
 
+fn parse_vecpak_entry_metadata(entry_term: &amadeus_fabric_doctor::vecpak::Term) -> Result<(u64, u64, Vec<u8>)> {
+    use amadeus_fabric_doctor::vecpak::Term as VTerm;
+
+    if let VTerm::PropList(props) = entry_term {
+        let mut height = 0u64;
+        let mut slot = 0u64;
+        let mut header_bin = vec![];
+
+        // Find header from entry
+        for (key, value) in props {
+            if let VTerm::Binary(key_bytes) = key {
+                if key_bytes == b"header" {
+                    if let VTerm::Binary(header_bytes) = value {
+                        header_bin = header_bytes.clone();
+                        // Decode header to get height and slot
+                        if let Ok(header_term) = decode_term_from_slice(header_bytes) {
+                            if let VTerm::PropList(header_props) = header_term {
+                                for (hkey, hvalue) in header_props {
+                                    if let VTerm::Binary(hkey_bytes) = hkey {
+                                        if hkey_bytes == b"height" {
+                                            if let VTerm::VarInt(h) = hvalue {
+                                                if h >= 0 {
+                                                    height = h as u64;
+                                                }
+                                            }
+                                        } else if hkey_bytes == b"slot" {
+                                            if let VTerm::VarInt(s) = hvalue {
+                                                if s >= 0 {
+                                                    slot = s as u64;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Compute entry hash (blake3 of header_bin)
+        let entry_hash = blake3::hash(&header_bin);
+        Ok((height, slot, entry_hash.as_bytes().to_vec()))
+    } else {
+        Err(anyhow!("Could not parse vecpak entry metadata"))
+    }
+}
+
 fn find_entry_at_height_indexed(
     source_db: &DB,
     source_entry_meta_cf: &impl rocksdb::AsColumnFamilyRef,
@@ -1015,7 +1085,13 @@ fn find_entry_at_height_indexed(
 }
 
 fn get_prev_height_from_entry(entry_data: &[u8], source_db: &DB) -> Result<Option<u64>> {
-    let term = Term::decode(entry_data)?;
+    // Try vecpak decoding first
+    if let Ok(vecpak_term) = decode_term_from_slice(entry_data) {
+        return get_prev_height_from_vecpak_entry(&vecpak_term, source_db);
+    }
+
+    // Fallback to ETF
+    let term = eetf::Term::decode(entry_data)?;
     if let Term::Map(map) = term {
         // Get header binary from entry
         if let Some(header_data) = map.map.get(&Term::Atom(eetf::Atom::from("header"))) {
