@@ -332,38 +332,45 @@ fn extract_heights(source_db: &DB) -> Result<(u64, u64)> {
     println!("  Found temporal_tip hash: {}", hex::encode(&temporal_tip_hash));
 
     // Find height by looking up the key directly
-    // Key format: by_height:{12-digit-height}:{hex-hash}
-    let temporal_tip_hex = hex::encode(&temporal_tip_hash);
-
-    // We don't know the height, so we need to scan, but we can look for the hash in the KEY
-    let prefix = "by_height:";
+    // Key format: by_height:{12-digit-height}:<binary-hash>
+    let prefix = b"by_height:";
     let mut found = false;
 
-    let iter = source_db.iterator_cf(&entry_meta_cf, rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward));
+    println!("  Scanning entry_meta for temporal_tip (first 3 keys)...");
+    let iter = source_db.iterator_cf(&entry_meta_cf, rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward));
 
+    let mut scan_count = 0;
     for item in iter {
         if let Ok((key, _hash_value)) = item {
-            if !key.starts_with(prefix.as_bytes()) {
+            if !key.starts_with(prefix) {
                 break;
             }
 
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                // Key format: by_height:000039434469:e04316615d09509db7a97807719b45745921b8e3f61dec5116e2e7e231ab087e
-                if key_str.ends_with(&temporal_tip_hex) {
-                    if let Some(height_str) = key_str.strip_prefix("by_height:") {
-                        if let Some(height_part) = height_str.split(':').next() {
-                            if let Ok(h) = height_part.parse::<u64>() {
-                                temporal_height = h;
-                                println!("  temporal_height from entry_meta: {}", temporal_height);
-                                found = true;
-                                break;
-                            }
-                        }
+            scan_count += 1;
+            if scan_count <= 3 {
+                println!("  Sample key [{}]: {} bytes", scan_count, key.len());
+                if key.len() > 13 {
+                    println!("    Prefix: {:?}", &key[0..13]);
+                    println!("    Hash part: {}", hex::encode(&key[13..]));
+                }
+            }
+
+            // Key format: b"by_height:" (10 bytes) + "000039434469:" (13 bytes) = 23 bytes prefix + 32 bytes hash
+            if key.len() >= 23 + 32 && key.ends_with(temporal_tip_hash.as_slice()) {
+                // Extract height from bytes 10-22 (12 digit string)
+                if let Ok(height_str) = std::str::from_utf8(&key[10..22]) {
+                    if let Ok(h) = height_str.parse::<u64>() {
+                        temporal_height = h;
+                        println!("  ✅ temporal_height from entry_meta: {}", temporal_height);
+                        found = true;
+                        break;
                     }
                 }
             }
         }
     }
+
+    println!("  Scanned {} entries", scan_count);
 
     if !found {
         return Err(anyhow!("Could not find temporal_tip hash in entry_meta keys"));
@@ -376,28 +383,23 @@ fn extract_heights(source_db: &DB) -> Result<(u64, u64)> {
         .ok_or_else(|| anyhow!("rooted_tip not found in sysconf"))?;
     println!("  Found rooted_tip hash: {}", hex::encode(&rooted_tip_hash));
 
-    let rooted_tip_hex = hex::encode(&rooted_tip_hash);
     found = false;
-
-    let iter = source_db.iterator_cf(&entry_meta_cf, rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward));
+    let iter = source_db.iterator_cf(&entry_meta_cf, rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward));
 
     for item in iter {
         if let Ok((key, _hash_value)) = item {
-            if !key.starts_with(prefix.as_bytes()) {
+            if !key.starts_with(prefix) {
                 break;
             }
 
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if key_str.ends_with(&rooted_tip_hex) {
-                    if let Some(height_str) = key_str.strip_prefix("by_height:") {
-                        if let Some(height_part) = height_str.split(':').next() {
-                            if let Ok(h) = height_part.parse::<u64>() {
-                                rooted_height = h;
-                                println!("  rooted_height from entry_meta: {}", rooted_height);
-                                found = true;
-                                break;
-                            }
-                        }
+            // Key format: b"by_height:" + "000039434469:" + <32-byte binary hash>
+            if key.len() >= 23 + 32 && key.ends_with(rooted_tip_hash.as_slice()) {
+                if let Ok(height_str) = std::str::from_utf8(&key[10..22]) {
+                    if let Ok(h) = height_str.parse::<u64>() {
+                        rooted_height = h;
+                        println!("  rooted_height from entry_meta: {}", rooted_height);
+                        found = true;
+                        break;
                     }
                 }
             }
