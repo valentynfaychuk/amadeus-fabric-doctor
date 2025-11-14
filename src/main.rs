@@ -410,6 +410,42 @@ fn extract_heights(source_db: &DB) -> Result<(u64, u64)> {
         rooted_height = temporal_height.saturating_sub(10);
     }
 
+    // Verify temporal_height against temporal_tip (more reliable than temporal_height key)
+    println!("🔍 Verifying temporal_height against temporal_tip...");
+    if let Some(temporal_tip_hash) = source_db.get_cf(&sysconf_cf, "temporal_tip".as_bytes())? {
+        if let Some(entry_meta_cf) = source_db.cf_handle("entry_meta") {
+            let prefix = "by_height:";
+            let iter = source_db.iterator_cf(&entry_meta_cf, rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward));
+
+            for item in iter {
+                if let Ok((key, hash_value)) = item {
+                    if !key.starts_with(prefix.as_bytes()) {
+                        break;
+                    }
+                    if &*hash_value == temporal_tip_hash.as_slice() {
+                        if let Ok(key_str) = std::str::from_utf8(&key) {
+                            if let Some(height_str) = key_str.strip_prefix("by_height:") {
+                                if let Some(height_part) = height_str.split(':').next() {
+                                    if let Ok(h) = height_part.parse::<u64>() {
+                                        println!("  temporal_tip actual height: {}", h);
+                                        println!("  temporal_height from sysconf key: {}", temporal_height);
+
+                                        if h != temporal_height {
+                                            println!("⚠️  Warning: temporal_tip height ({}) differs from temporal_height key ({})", h, temporal_height);
+                                            println!("  Using temporal_tip height as the correct value");
+                                            temporal_height = h;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok((temporal_height, rooted_height))
 }
 
