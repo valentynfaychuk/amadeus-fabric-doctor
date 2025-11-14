@@ -795,12 +795,53 @@ fn migrate_muts_rev_selective(source_db: &DB, target_db: &DB, temporal_entry_has
         .cf_handle("entry_meta")
         .ok_or_else(|| anyhow!("entry_meta CF not found in target"))?;
 
+    // Debug: Sample what keys exist in entry_meta
+    println!("🔍 Sampling entry_meta CF to see key format...");
+    let mut sample_count = 0;
+    let iter = source_db.iterator_cf(&source_cf, rocksdb::IteratorMode::Start);
+    for item in iter {
+        if sample_count >= 20 {
+            break;
+        }
+        if let Ok((key, _)) = item {
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                if key_str.contains("muts_rev") || key_str.contains("muts:") {
+                    println!("  Sample key: {}", key_str);
+                    sample_count += 1;
+                }
+            }
+        }
+    }
+
     let mut count = 0;
     let mut write_batch = rocksdb::WriteBatch::default();
     let batch_size = 1000;
     let mut not_found = 0;
 
-    // Process only temporal entry hashes
+    // Process only temporal entry hashes - try both hex and binary formats
+    for entry_hash in temporal_entry_hashes.iter().take(5) {
+        // Try hex format
+        let key_hex = format!("entry:{}:muts_rev", hex::encode(entry_hash));
+        // Try binary format
+        let mut key_bin = b"entry:".to_vec();
+        key_bin.extend_from_slice(entry_hash);
+        key_bin.extend_from_slice(b":muts_rev");
+
+        if let Some(value) = source_db.get_cf(&source_cf, key_hex.as_bytes())? {
+            println!("  Found with hex format!");
+            count += 1;
+        } else if let Some(value) = source_db.get_cf(&source_cf, &key_bin)? {
+            println!("  Found with binary format!");
+            count += 1;
+        } else {
+            not_found += 1;
+        }
+    }
+
+    println!("  Tested 5 entries: {} found, {} not found", count, not_found);
+    println!("  Skipping full migration until we know the correct key format");
+
+    // Now do actual migration if we found the right format
     for entry_hash in temporal_entry_hashes {
         let key = format!("entry:{}:muts_rev", hex::encode(entry_hash));
         if let Some(value) = source_db.get_cf(&source_cf, key.as_bytes())? {
