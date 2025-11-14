@@ -299,23 +299,6 @@ fn extract_heights(source_db: &DB) -> Result<(u64, u64)> {
         .cf_handle("sysconf")
         .ok_or_else(|| anyhow!("sysconf column family not found"))?;
 
-    // Debug: List all keys in sysconf CF to see what's actually there
-    println!("🔍 Debugging sysconf CF contents:");
-    let iter = source_db.iterator_cf(&sysconf_cf, rocksdb::IteratorMode::Start);
-    for (i, item) in iter.enumerate() {
-        if i >= 20 { // Limit to first 20 entries
-            println!("... (showing first 20 entries)");
-            break;
-        }
-        match item {
-            Ok((key, value)) => {
-                let key_str = std::str::from_utf8(&key).unwrap_or("<invalid UTF-8>");
-                let key_hex = hex::encode(&key);
-                println!("  Key: '{}' (hex: {}) -> Value: {} bytes", key_str, key_hex, value.len());
-            }
-            Err(e) => println!("  Error reading entry: {}", e),
-        }
-    }
 
     let mut temporal_height = 0u64;
     let mut rooted_height = 0u64;
@@ -336,32 +319,19 @@ fn extract_heights(source_db: &DB) -> Result<(u64, u64)> {
     let prefix = b"by_height:";
     let mut found = false;
 
-    println!("  Scanning entry_meta for temporal_tip (first 3 keys)...");
     let iter = source_db.iterator_cf(&entry_meta_cf, rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward));
 
-    let mut scan_count = 0;
     for item in iter {
         if let Ok((key, _hash_value)) = item {
             if !key.starts_with(prefix) {
                 break;
             }
 
-            scan_count += 1;
-            if scan_count <= 3 {
-                println!("  Sample key [{}]: {} bytes", scan_count, key.len());
-                if key.len() > 13 {
-                    println!("    Prefix: {:?}", &key[0..13]);
-                    println!("    Hash part: {}", hex::encode(&key[13..]));
-                }
-            }
-
-            // Key format: b"by_height:" (10 bytes) + "000039434469:" (13 bytes) = 23 bytes prefix + 32 bytes hash
             if key.len() >= 23 + 32 && key.ends_with(temporal_tip_hash.as_slice()) {
-                // Extract height from bytes 10-22 (12 digit string)
                 if let Ok(height_str) = std::str::from_utf8(&key[10..22]) {
                     if let Ok(h) = height_str.parse::<u64>() {
                         temporal_height = h;
-                        println!("  ✅ temporal_height from entry_meta: {}", temporal_height);
+                        println!("  temporal_height from entry_meta: {}", temporal_height);
                         found = true;
                         break;
                     }
@@ -369,8 +339,6 @@ fn extract_heights(source_db: &DB) -> Result<(u64, u64)> {
             }
         }
     }
-
-    println!("  Scanned {} entries", scan_count);
 
     if !found {
         return Err(anyhow!("Could not find temporal_tip hash in entry_meta keys"));
