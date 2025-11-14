@@ -29,9 +29,13 @@ pub fn get_prev_height_from_vecpak_entry(entry_term: &Term, source_db: &DB) -> R
 
 fn get_prev_hash_from_header(header_term: &Term, source_db: &DB) -> Result<Option<u64>> {
     if let Term::PropList(props) = header_term {
+        println!("  [DEBUG] Searching for prev_hash in header with {} props", props.len());
         for (key, value) in props {
             if let Term::Binary(key_bytes) = key {
+                let key_str = String::from_utf8_lossy(key_bytes);
+                println!("  [DEBUG] Checking key: {}", key_str);
                 if key_bytes == b"prev_hash" {
+                    println!("  [DEBUG] FOUND prev_hash!");
                     if let Term::Binary(prev_hash_bytes) = value {
                         if prev_hash_bytes.len() == 32 {
                             let prev_hash: [u8; 32] = prev_hash_bytes[..].try_into().unwrap();
