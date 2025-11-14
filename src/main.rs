@@ -1022,23 +1022,26 @@ fn parse_vecpak_entry_metadata(entry_term: &amadeus_fabric_doctor::vecpak::Term)
         for (key, value) in props {
             if let VTerm::Binary(key_bytes) = key {
                 if key_bytes == b"header" {
-                    if let VTerm::Binary(header_bytes) = value {
-                        header_bin = header_bytes.clone();
-                        // Decode header to get height and slot
-                        if let Ok(header_term) = decode_term_from_slice(header_bytes) {
-                            if let VTerm::PropList(header_props) = header_term {
-                                for (hkey, hvalue) in header_props {
-                                    if let VTerm::Binary(hkey_bytes) = hkey {
-                                        if hkey_bytes == b"height" {
-                                            if let VTerm::VarInt(h) = hvalue {
-                                                if h >= 0 {
-                                                    height = h as u64;
+                    // Header can be Binary (encoded) or PropList (already decoded)
+                    match value {
+                        VTerm::Binary(header_bytes) => {
+                            header_bin = header_bytes.clone();
+                            // Decode header to get height and slot
+                            if let Ok(header_term) = decode_term_from_slice(header_bytes) {
+                                if let VTerm::PropList(header_props) = header_term {
+                                    for (hkey, hvalue) in header_props {
+                                        if let VTerm::Binary(hkey_bytes) = hkey {
+                                            if hkey_bytes == b"height" {
+                                                if let VTerm::VarInt(h) = hvalue {
+                                                    if h >= 0 {
+                                                        height = h as u64;
+                                                    }
                                                 }
-                                            }
-                                        } else if hkey_bytes == b"slot" {
-                                            if let VTerm::VarInt(s) = hvalue {
-                                                if s >= 0 {
-                                                    slot = s as u64;
+                                            } else if hkey_bytes == b"slot" {
+                                                if let VTerm::VarInt(s) = hvalue {
+                                                    if s >= 0 {
+                                                        slot = s as u64;
+                                                    }
                                                 }
                                             }
                                         }
@@ -1046,6 +1049,32 @@ fn parse_vecpak_entry_metadata(entry_term: &amadeus_fabric_doctor::vecpak::Term)
                                 }
                             }
                         }
+                        VTerm::PropList(header_props) => {
+                            // Header is already a PropList, encode it to get hash
+                            let mut header_buf = vec![];
+                            amadeus_fabric_doctor::vecpak::encode_term(&mut header_buf, value.clone());
+                            header_bin = header_buf;
+
+                            // Extract height and slot
+                            for (hkey, hvalue) in header_props {
+                                if let VTerm::Binary(hkey_bytes) = hkey {
+                                    if hkey_bytes == b"height" {
+                                        if let VTerm::VarInt(h) = hvalue {
+                                            if *h >= 0 {
+                                                height = *h as u64;
+                                            }
+                                        }
+                                    } else if hkey_bytes == b"slot" {
+                                        if let VTerm::VarInt(s) = hvalue {
+                                            if *s >= 0 {
+                                                slot = *s as u64;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
