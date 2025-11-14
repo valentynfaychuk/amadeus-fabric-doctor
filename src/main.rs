@@ -333,6 +333,9 @@ fn extract_heights(source_db: &DB) -> Result<(u64, u64)> {
 
     // Find height from entry_meta by scanning for the hash
     let prefix = "by_height:";
+    println!("  Scanning entry_meta for temporal_tip hash...");
+
+    let mut scanned = 0;
     let iter = source_db.iterator_cf(&entry_meta_cf, rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward));
 
     for item in iter {
@@ -340,13 +343,24 @@ fn extract_heights(source_db: &DB) -> Result<(u64, u64)> {
             if !key.starts_with(prefix.as_bytes()) {
                 break;
             }
+
+            scanned += 1;
+            if scanned <= 5 || scanned % 100000 == 0 {
+                if let Ok(key_str) = std::str::from_utf8(&key) {
+                    println!("  [{}] Key: {}, Value: {} bytes", scanned, key_str, hash_value.len());
+                    if scanned <= 3 {
+                        println!("      Value hash: {}", hex::encode(&hash_value));
+                    }
+                }
+            }
+
             if &*hash_value == temporal_tip_hash.as_slice() {
                 if let Ok(key_str) = std::str::from_utf8(&key) {
                     if let Some(height_str) = key_str.strip_prefix("by_height:") {
                         if let Some(height_part) = height_str.split(':').next() {
                             if let Ok(h) = height_part.parse::<u64>() {
                                 temporal_height = h;
-                                println!("  temporal_height from entry_meta: {}", temporal_height);
+                                println!("  ✅ Found temporal_tip at height: {}", temporal_height);
                                 break;
                             }
                         }
@@ -356,8 +370,10 @@ fn extract_heights(source_db: &DB) -> Result<(u64, u64)> {
         }
     }
 
+    println!("  Scanned {} by_height entries", scanned);
+
     if temporal_height == 0 {
-        return Err(anyhow!("Could not find temporal_tip in entry_meta"));
+        return Err(anyhow!("Could not find temporal_tip in entry_meta after scanning {} entries", scanned));
     }
 
     // Get rooted_tip and derive height from entry_meta
