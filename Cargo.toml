@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Source DB compatibility: Erlang uses RocksDB 7.7.3, closest available is 0.19.0 (RocksDB 7.4.4)
-# For migration we need to enforce proper version usage:
-# - Source database: 0.19.0 for reading old Erlang format
-# - Target database: 0.23.0 for writing new format
 rocksdb = "0.23.0"
 serde_json = "1.0"
 clap = { version = "4.0", features = ["derive"] }
@@ -21,9 +17,6 @@ num_cpus = "1.0"
 blake3 = "1.0"
 tokio = { version = "1.0", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
 
-# For ETF parsing - Erlang Term Format
 eetf = "0.11.0"
 
 [workspace]
-# workaround to allow running this crate independently
-# even if it is cloned into an umbrella cargo workspace
