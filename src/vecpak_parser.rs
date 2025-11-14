@@ -79,38 +79,66 @@ fn get_prev_hash_from_header(header_term: &Term, source_db: &DB) -> Result<Optio
 }
 
 fn get_height_from_entry(entry_term: &Term) -> Result<Option<u64>> {
+    println!("  [DEBUG] get_height_from_entry called");
     // Entry is a PropList with header key
     if let Term::PropList(props) = entry_term {
+        println!("  [DEBUG] Entry is PropList with {} props", props.len());
         for (key, value) in props {
             if let Term::Binary(key_bytes) = key {
                 if key_bytes == b"header" {
-                    if let Term::Binary(header_bytes) = value {
-                        if let Ok(header_term) = crate::vecpak::decode_term_from_slice(header_bytes) {
-                            return get_height_from_header(&header_term);
+                    println!("  [DEBUG] Found header in entry");
+                    match value {
+                        Term::Binary(header_bytes) => {
+                            println!("  [DEBUG] Header is Binary, decoding...");
+                            if let Ok(header_term) = crate::vecpak::decode_term_from_slice(header_bytes) {
+                                return get_height_from_header(&header_term);
+                            } else {
+                                println!("  [DEBUG] Failed to decode header");
+                            }
+                        }
+                        Term::PropList(_) => {
+                            println!("  [DEBUG] Header is already PropList");
+                            return get_height_from_header(value);
+                        }
+                        _ => {
+                            println!("  [DEBUG] Header is unexpected type");
                         }
                     }
                 }
             }
         }
+    } else {
+        println!("  [DEBUG] Entry is not PropList");
     }
 
+    println!("  [DEBUG] Returning None from get_height_from_entry");
     Ok(None)
 }
 
 fn get_height_from_header(header_term: &Term) -> Result<Option<u64>> {
+    println!("  [DEBUG] get_height_from_header called");
     if let Term::PropList(props) = header_term {
+        println!("  [DEBUG] Header has {} props", props.len());
         for (key, value) in props {
             if let Term::Binary(key_bytes) = key {
+                let key_str = String::from_utf8_lossy(key_bytes);
                 if key_bytes == b"height" {
+                    println!("  [DEBUG] Found height key!");
                     if let Term::VarInt(height) = value {
+                        println!("  [DEBUG] Height is VarInt: {}", height);
                         if *height >= 0 {
                             return Ok(Some(*height as u64));
                         }
+                    } else {
+                        println!("  [DEBUG] Height is not VarInt: {:?}", value);
                     }
                 }
             }
         }
+    } else {
+        println!("  [DEBUG] Header is not PropList");
     }
 
+    println!("  [DEBUG] Returning None from get_height_from_header");
     Ok(None)
 }
