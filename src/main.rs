@@ -206,9 +206,10 @@ fn perform_migration(source_db_path: &str, target_db_path: &str) -> Result<()> {
     // Step 2: Migrate contractstate (full)
     migrate_contractstate_full(&source_db, &target_db)?;
 
-    // Step 3: Migrate sysconf (full) + add rooted_height
+    // Step 3: Migrate sysconf (full) + add temporal_height and rooted_height
     migrate_sysconf_full(&source_db, &target_db)?;
-    write_rooted_height_to_sysconf(&target_db, rooted_height)?;
+    write_height_to_sysconf(&target_db, "temporal_height", temporal_height)?;
+    write_height_to_sysconf(&target_db, "rooted_height", rooted_height)?;
 
     // Step 4: Migrate default CF (selective: temporal to rooted + chain to genesis)
     let migrated_entry_hashes = migrate_default_selective(&source_db, &target_db, temporal_height, rooted_height)?;
@@ -762,26 +763,18 @@ fn migrate_muts_rev_selective(source_db: &DB, target_db: &DB, temporal_entry_has
     Ok(())
 }
 
-fn write_rooted_height_to_sysconf(target_db: &DB, rooted_height: u64) -> Result<()> {
-    println!("🔄 Writing rooted_height to sysconf...");
+fn write_height_to_sysconf(target_db: &DB, key: &str, height: u64) -> Result<()> {
+    println!("🔄 Writing {} to sysconf...", key);
 
     let target_cf = target_db
         .cf_handle("sysconf")
         .ok_or_else(|| anyhow!("sysconf CF not found in target"))?;
 
-    // Encode rooted_height as ETF (matching temporal_height format)
-    // For blockchain heights, FixInteger (i32) should suffice for reasonable heights
-    let mut encoded_height = Vec::new();
-    if rooted_height <= i32::MAX as u64 {
-        Term::FixInteger(eetf::FixInteger { value: rooted_height as i32 }).encode(&mut encoded_height)?;
-    } else {
-        // For very large heights, encode as a binary string (will be parsed back as integer)
-        let height_str = rooted_height.to_string();
-        Term::Binary(eetf::Binary { bytes: height_str.into_bytes() }).encode(&mut encoded_height)?;
-    }
+    // Write height as string (e.g., "1234")
+    let height_string = height.to_string();
 
-    target_db.put_cf(&target_cf, "rooted_height".as_bytes(), &encoded_height)?;
-    println!("✅ rooted_height ({}) written to sysconf", rooted_height);
+    target_db.put_cf(&target_cf, key.as_bytes(), height_string.as_bytes())?;
+    println!("✅ {} ({}) written to sysconf as string \"{}\"", key, height, height_string);
     Ok(())
 }
 
